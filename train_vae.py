@@ -5,7 +5,6 @@ import torch.multiprocessing as mp
 from collections import OrderedDict
 from utils import make_hyparam_string, save_new_pickle, read_pickle, SavePloat_Voxels, generateZ, calculate_iou, calculate_metrics
 from utils import calculate_wasserstein_loss_d, calculate_wasserstein_loss_g, compute_gradient_penalty, calculate_accuracy_for_wasserstein
-from utils import apply_2d_mixup, apply_3d_mixup, apply_latent_mixup
 import utils
 import os
 import time
@@ -90,12 +89,13 @@ def train_vae(args):
         D_solver = optim.Adam(D.parameters(), lr=args.d_lr, betas=(0.5, 0.9))
         G_solver = optim.Adam(G.parameters(), lr=args.g_lr, betas=(0.5, 0.9))
         E_solver = optim.Adam(E.parameters(), lr=args.e_lr, betas=(0.5, 0.9))
-        print("Wasserstein GAN modunda çalışılıyor - optimizer ayarları güncellendi")
+        print(f"Wasserstein GAN modunda çalışılıyor - LR D:{args.d_lr}, G:{args.g_lr}, E:{args.e_lr}")
     else:
         # Geleneksel GAN optimizer ayarları
         D_solver = optim.Adam(D.parameters(), lr=args.d_lr, betas=args.beta)
         G_solver = optim.Adam(G.parameters(), lr=args.g_lr, betas=args.beta)
         E_solver = optim.Adam(E.parameters(), lr=args.e_lr, betas=args.beta)
+        print(f"Normal GAN modunda çalışılıyor - LR D:{args.d_lr}, G:{args.g_lr}, E:{args.e_lr}")
 
     # Learning rate schedulers for all models
     if args.use_scheduler:
@@ -155,14 +155,16 @@ def train_vae(args):
     # Loss fonksiyonları
     criterion = nn.BCEWithLogitsLoss()  # WGAN modunda kullanılmaz, sadece normal GAN için
 
-    pickle_path = "." + args.pickle_dir + log_param
-    read_pickle(pickle_path, G, G_solver, D, D_solver)
+    pickle_path = args.output_dir + args.pickle_dir + log_param
+    read_pickle(pickle_path, G, G_solver, D, D_solver, E, E_solver)
 
     # Plateau scheduler için en iyi metrikleri izleme
     if args.use_scheduler and args.scheduler_type == 'plateau':
         best_d_loss = float('inf')
         best_g_loss = float('inf')
         best_recon_loss = float('inf')
+
+    global_step = 0
 
     for epoch in range(args.n_epochs):
         # GPU belleğini optimize et
@@ -193,7 +195,8 @@ def train_vae(args):
         n_critic = 5 if args.wasserstein else 1
         
         for i, (image, model_3d) in enumerate(dset_loaders):
-            # Her bir float tensörünü half precision'a çevirme
+            global_step += 1
+            # Verileri GPU'ya hazırla
             if args.use_amp:
                 model_3d = model_3d.to(device='cuda', non_blocking=True)
                 image = image.to(device='cuda', non_blocking=True)
@@ -201,184 +204,136 @@ def train_vae(args):
                 model_3d = var_or_cuda(model_3d)
                 image = var_or_cuda(image)
 
+            # Voxel boyutunu [B, 1, D, H, W] formatına getir
+            if model_3d.dim() == 4:
+                model_3d = model_3d.unsqueeze(1)
+
             if model_3d.size()[0] != int(args.batch_size):
                 continue
 
+            # ============= MIXUP PREPARATION ============= #
+            # Varsayılan olarak orijinal verileri kullan
+            input_image = image
+            target_voxel = model_3d
+            
+            # MixUp aktifse uygula
+            if args.use_2d_mixup and np.random.random() < args.mixup_prob:
+                input_image, target_voxel, lam, index = utils.apply_unified_mixup(image, model_3d, args.mixup_alpha)
+
             # ============= Train the critic/discriminator =============#
-            # Her n_critic iterasyonda bir, critic'i eğitiyoruz
-            # Ama önce scaler'ı bir kez güncellemeliyiz
             if args.wasserstein:
                 for critic_iter in range(n_critic):
                     with autocast(device_type='cuda', enabled=args.use_amp):
                         Z = generateZ(args)
                         
-                        # MixUp uygulamaları (aktif ise)
-                        if args.use_2d_mixup and np.random.random() < args.mixup_prob:
-                            image_mixed = apply_2d_mixup(image, args.mixup_alpha)
-                        else:
-                            image_mixed = image
+                        # VAE Akışı: Karıştırılmış görüntüden Z üret
+                        z_mu, z_var = E(input_image)
+                        Z_vae = E.reparameterize(z_mu, z_var)
                         
-                        if args.use_3d_mixup and np.random.random() < args.mixup_prob:
-                            model_3d_view = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
-                            model_3d_mixed = apply_3d_mixup(model_3d_view, args.mixup_alpha)
-                        else:
-                            model_3d_view = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
-                            model_3d_mixed = model_3d_view
+                        # Discriminator Girdileri
+                        # 1. Gerçek: Karıştırılmış Voxel (Target)
+                        d_real = D(target_voxel)
                         
-                        # Encoder çıktıları
-                        z_mu, z_var = E(image_mixed)
-                        
-                        # Latent MixUp (aktif ise)
-                        if args.use_latent_mixup and np.random.random() < args.mixup_prob:
-                            z_mu_mixed, z_var_mixed = apply_latent_mixup(z_mu, z_var, args.mixup_alpha)
-                        else:
-                            z_mu_mixed, z_var_mixed = z_mu, z_var
-                        
-                        Z_vae = E.reparameterize(z_mu_mixed, z_var_mixed)
-                        G_vae = G(Z_vae)
-                        
-                        # Discriminator çıktıları
-                        d_real = D(model_3d_mixed)
+                        # 2. Sahte: Generator Çıktısı (Noise'dan)
                         fake = G(Z)
-                        d_fake = D(fake.detach())  # Generator'ın gradyandan etkilenmemesi için detach
+                        d_fake = D(fake.detach())
                         
-                        # Wasserstein loss hesaplama
+                        # Loss Hesaplama
                         d_loss = calculate_wasserstein_loss_d(d_real, d_fake)
                         
-                        # Gradient penalty (WGAN-GP) ekle - Spectral Norm ile birlikte kullanılıyorsa ağırlığı düşür
+                        # Gradient Penalty
                         if args.gradient_penalty:
-                            # Spectral normalizasyon kullanılıyorsa daha düşük GP değeri kullan
-                            effective_lambda = args.lambda_gp
-                            if args.use_spectral_norm:
-                                effective_lambda = 1.0  # SN ile GP ağırlığını önemli ölçüde azalt (10 yerine 1)
-                            
-                            gp = compute_gradient_penalty(D, model_3d_mixed, fake.detach(), device='cuda', lambda_gp=effective_lambda)
+                            # Hakem isteği üzerine lambda_gp artık doğrudan parametreden alınıyor (Hassasiyet analizi için)
+                            gp = compute_gradient_penalty(D, target_voxel, fake.detach(), device='cuda', lambda_gp=args.lambda_gp)
                             d_loss = d_loss + gp
-                            if critic_iter == 0:  # İlk iterasyonda metrikleri kaydet
-                                epoch_gp += gp.item()
+                            if critic_iter == 0: epoch_gp += gp.item()
                     
-                    # WGAN için weight clipping - spectral norm kullanılıyorsa tamamen devre dışı bırak
-                    if not args.gradient_penalty and not args.use_spectral_norm:
-                        for p in D.parameters():
-                            p.data.clamp_(-args.clip_value, args.clip_value)
-                    
-                    # Critic eğitimi
+                    # Discriminator Update
                     D.zero_grad()
                     scaler.scale(d_loss).backward()
                     scaler.step(D_solver)
-                    scaler.update()  # Her critic adımından sonra güncelleme
+                    scaler.update()
                     
-                    # İlk iterasyonda metrikleri kaydet
                     if critic_iter == 0:
-                        d_total_acu = calculate_accuracy_for_wasserstein(d_real, d_fake, True)
                         epoch_d_loss += d_loss.item()
-                        epoch_d_total_acu += d_total_acu.item()
-            else:
-                # Normal GAN için tek iterasyon eğitim
+            
+            else: # Normal GAN
+                # Benzer mantık, sadece loss fonksiyonu farklı
                 with autocast(device_type='cuda', enabled=args.use_amp):
-                    Z = generateZ(args)
-                    
-                    # MixUp uygulamaları (aktif ise)
-                    if args.use_2d_mixup and np.random.random() < args.mixup_prob:
-                        image = apply_2d_mixup(image, args.mixup_alpha)
-                    
-                    if args.use_3d_mixup and np.random.random() < args.mixup_prob:
-                        model_3d = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
-                        model_3d = apply_3d_mixup(model_3d, args.mixup_alpha)
-                    
-                    z_mu, z_var = E(image)
-                    
-                    # Latent MixUp (aktif ise)
-                    if args.use_latent_mixup and np.random.random() < args.mixup_prob:
-                        z_mu, z_var = apply_latent_mixup(z_mu, z_var, args.mixup_alpha)
-                    
+                    z_mu, z_var = E(input_image)
                     Z_vae = E.reparameterize(z_mu, z_var)
-                    G_vae = G(Z_vae)
-
-                    # Geleneksel GAN loss hesaplama
+                    
                     real_labels = var_or_cuda(torch.ones(args.batch_size))
                     fake_labels = var_or_cuda(torch.zeros(args.batch_size))
-
-                    if args.soft_label:
+                    
+                    if args.soft_label: # Soft label da mixup lambda ile orantılı olabilir ama şimdilik basit tutalım
                         real_labels = var_or_cuda(torch.Tensor(args.batch_size).uniform_(0.7, 1.0))
                         fake_labels = var_or_cuda(torch.Tensor(args.batch_size).uniform_(0, 0.3))
 
-                    d_real = D(model_3d)
+                    d_real = D(target_voxel)
                     d_real_loss = criterion(d_real.squeeze(), real_labels)
 
+                    Z = generateZ(args)
                     fake = G(Z)
                     d_fake = D(fake.detach())
                     d_fake_loss = criterion(d_fake.squeeze(), fake_labels)
 
                     d_loss = d_real_loss + d_fake_loss
                     
-                    # Normal GAN için metrikleri kaydet
-                    epoch_d_real_loss += d_real_loss.item()
-                    epoch_d_fake_loss += d_fake_loss.item()
                     epoch_d_loss += d_loss.item()
                     
-                    # Discriminator doğruluğunu hesaplama
-                    d_total_acu = calculate_accuracy_for_wasserstein(d_real, d_fake, False)
-                    epoch_d_total_acu += d_total_acu.item()
-
-                # Normal GAN için discriminator eğitimi
-                if d_total_acu <= args.d_thresh:
-                    D.zero_grad()
-                    scaler.scale(d_loss).backward()
-                    scaler.step(D_solver)
-                    scaler.update()
+                # Discriminator Update
+                D.zero_grad()
+                scaler.scale(d_loss).backward()
+                scaler.step(D_solver)
+                scaler.update()
 
             # ============= Train the Encoder =============#
             with autocast(device_type='cuda', enabled=args.use_amp):
-                # Burada model_3d'yi WGAN için tekrar düzgün formata getirmeliyiz
-                if not args.wasserstein or model_3d.dim() != 5:
-                    model_3d = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+                # VAE Akışı: Karıştırılmış görüntü -> Voxel
+                z_mu, z_var = E(input_image)
+                Z_vae = E.reparameterize(z_mu, z_var)
+                G_vae = G(Z_vae)
                 
-                # Recon loss: Batch başına ortalama MSE
-                recon_loss = torch.mean(torch.sum(torch.pow((G_vae - model_3d), 2), dim=(1, 2, 3, 4)))
+                # RECONSTRUCTION LOSS (KRİTİK DÜZELTME)
+                # Üretilen voxel'i, karıştırılmış hedef (target_voxel) ile karşılaştır
+                recon_loss = torch.nn.functional.mse_loss(G_vae, target_voxel)
                 
-                # KL kaybını batch ortalaması alınarak hesaplama
                 KLLoss = -0.5 * torch.mean(torch.sum(1 + z_var - torch.pow(z_mu, 2) - torch.exp(z_var), dim=1))
-                
-                # VAE β-parametresi ile iki kaybı dengeleme
-                beta = 1.0  # Varsayılan beta değeri
-                E_loss = recon_loss + beta * KLLoss
+                E_loss = recon_loss + args.lambda_kl * KLLoss
 
-            # IoU değerini batch için hesaplama
-            batch_iou = calculate_iou(G_vae, model_3d)
+            batch_iou = calculate_iou(G_vae, target_voxel) # IoU'yu da doğru target ile hesapla
             
             E.zero_grad()
-            # AMP ile gradient hesaplama ve optimizasyon
             scaler.scale(E_loss).backward()
             scaler.step(E_solver)
             scaler.update()
             
             # =============== Train the generator ===============#
             with autocast(device_type='cuda', enabled=args.use_amp):
-                # Yeni örnekler oluşturulup, discriminator üzerinden geçiyor
+                # 1. GAN Loss (Noise -> Fake)
                 Z_new = generateZ(args)
                 fake = G(Z_new)
                 d_fake = D(fake)
                 
                 if args.wasserstein:
-                    # Wasserstein loss for generator
                     gan_loss = calculate_wasserstein_loss_g(d_fake)
                 else:
-                    # Normal GAN loss for generator
                     real_labels = var_or_cuda(torch.ones(args.batch_size))
                     gan_loss = criterion(d_fake.squeeze(), real_labels)
                 
-                # VAE branch'ı ile yeniden oluşturma hatasını hesaplama
-                Z_vae_detached = Z_vae.detach()
-                G_vae_new = G(Z_vae_detached)
-                recon_loss_new = torch.mean(torch.sum(torch.pow((G_vae_new - model_3d), 2), dim=(1, 2, 3, 4)))
+                # 2. VAE Reconstruction Loss (Image -> G_vae)
+                # Generator da recon loss'tan öğrenmeli
+                # Gradyanların G üzerinden akması için tekrar hesaplama veya graph'ı tutma
+                # Burada Z_vae.detach() kullanarak G'yi E'den bağımsız eğitiyoruz (standart VAE-GAN)
+                # Ancak G_vae zaten yukarıda hesaplandı, graph'ı tutabiliriz ama memory için tekrar forward daha güvenli
                 
-                lambda_recon = 1.0  # İhtiyaca göre ayarlanabilir
-                g_loss = gan_loss + lambda_recon * recon_loss_new
+                G_vae_for_G = G(Z_vae.detach()) # Encoder'ı dondur, sadece G'yi güncelle
+                recon_loss_g = torch.nn.functional.mse_loss(G_vae_for_G, target_voxel)
+                
+                g_loss = gan_loss + args.lambda_recon * recon_loss_g
 
-            # Generator eğitimi
             G.zero_grad()
-            # AMP ile gradient hesaplama ve optimizasyon
             scaler.scale(g_loss).backward()
             scaler.step(G_solver)
             scaler.update()
@@ -478,7 +433,7 @@ def train_vae(args):
                     inject_summary(summary_writer, tag, value, epoch)
 
         # =============== logging each iteration ===============#
-        iteration = int(G_solver.state_dict()['state'][G_solver.state_dict()['param_groups'][0]['params'][0]]['step'].item())
+        iteration = global_step
         if args.use_tensorboard:
             log_save_path = args.output_dir + args.log_dir + log_param
             if not os.path.exists(log_save_path):

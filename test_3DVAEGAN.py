@@ -4,6 +4,7 @@ from torch import nn
 from collections import OrderedDict
 from utils import make_hyparam_string, save_new_pickle, read_pickle, SavePloat_Voxels, generateZ
 from utils import calculate_iou, calculate_metrics, calculate_accuracy_for_wasserstein
+from utils import calculate_reconstruction_fscore, calculate_chamfer_distance_voxels
 from utils import calculate_wasserstein_loss_d, calculate_wasserstein_loss_g  # WGAN loss fonksiyonları
 import os
 import time
@@ -62,8 +63,8 @@ def test_3DVAEGAN(args):
     G = _G(args)
     D =_D(args)
     G_solver = optim.Adam(G.parameters(), lr=args.g_lr, betas=args.beta)
-    E_solver = optim.Adam(E.parameters(), lr=args.g_lr, betas=args.beta)
-    D_solver= optim.Adam(D.parameters(), lr=args.g_lr, betas=args.beta)
+    E_solver = optim.Adam(E.parameters(), lr=args.e_lr, betas=args.beta)
+    D_solver= optim.Adam(D.parameters(), lr=args.d_lr, betas=args.beta)
     
     # Test sırasında scheduler kullanmıyoruz, yalnızca bilgi amaçlı ekliyoruz
     if args.use_scheduler:
@@ -88,6 +89,8 @@ def test_3DVAEGAN(args):
     # Metrik hesaplama için değişkenler
     total_recon_loss = 0
     total_iou = 0
+    total_f_score = 0
+    total_cd = 0
     total_d_loss = 0
     total_d_accuracy = 0
     batch_count = 0
@@ -107,19 +110,16 @@ def test_3DVAEGAN(args):
     if not os.path.exists(results_dir):
         os.makedirs(results_dir)
     
-    results_file = f"{results_dir}/test_results_{test_date}{'_wgan' if args.wasserstein else ''}.txt"
+    results_file = f"{results_dir}/{args.model_name}_test_results_{test_date}.txt"
     
-    with open(results_file, 'w') as f:
+    # UTF-8 ile dosyayı aç
+    with open(results_file, 'w', encoding='utf-8') as f:
         model_type = "Wasserstein 3D-VAE-GAN" if args.wasserstein else "3D-VAE-GAN"
         f.write(f"{model_type} Test Sonuçları - {test_date}\n")
-        f.write("=" * 50 + "\n\n")
+        f.write("=" * 70 + "\n\n")
         
-        if args.wasserstein:
-            f.write("Batch No | Recon Loss | IoU | D Loss | D Accuracy\n")
-        else:
-            f.write("Batch No | Recon Loss | IoU | Precision | Recall | F1 Score\n")
-        
-        f.write("-" * 70 + "\n")
+        f.write("Batch | Recon Loss | IoU | F-Score | CD | D Loss | D Accuracy\n")
+        f.write("-" * 80 + "\n")
     
     with torch.no_grad():  # Torch no_grad ile gradyanların hesaplanmasını önlüyoruz
         for i, (image, model_3d) in enumerate(dset_loaders):
@@ -133,8 +133,11 @@ def test_3DVAEGAN(args):
                 X = var_or_cuda(model_3d)
                 image = var_or_cuda(image)
             
-            # X'i doğru şekilde yeniden şekillendir
-            X_reshaped = X.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+            # X'i doğru şekilde yeniden şekillendir [B, 1, D, H, W]
+            if X.dim() == 4:
+                X_reshaped = X.unsqueeze(1)
+            else:
+                X_reshaped = X.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
 
             # AMP kullanarak hesaplama
             with autocast(device_type='cuda', enabled=args.use_amp):
@@ -162,8 +165,10 @@ def test_3DVAEGAN(args):
                     d_fake_loss = criterion(d_fake.squeeze(), fake_labels)
                     d_loss = d_real_loss + d_fake_loss
             
-            # IoU hesapla
-            batch_iou = calculate_iou(G_vae, X_reshaped, threshold=0.5)
+            # Rekonstrüksiyon metriklerini hesapla
+            batch_iou = calculate_iou(G_vae, X_reshaped, threshold=args.voxel_threshold)
+            batch_f_score = calculate_reconstruction_fscore(G_vae, X_reshaped, threshold=args.voxel_threshold)
+            batch_cd = calculate_chamfer_distance_voxels(G_vae, X_reshaped, threshold=args.voxel_threshold)
             
             # Discriminator doğruluğunu hesapla
             d_accuracy = calculate_accuracy_for_wasserstein(d_real, d_fake, args.wasserstein)
@@ -180,6 +185,8 @@ def test_3DVAEGAN(args):
             # Toplam değerlere ekle
             total_recon_loss += recon_loss.item()
             total_iou += batch_iou
+            total_f_score += batch_f_score
+            total_cd += batch_cd
             total_d_loss += d_loss.item()
             total_d_accuracy += d_accuracy.item()
             
@@ -193,19 +200,10 @@ def test_3DVAEGAN(args):
             batch_time = time.time() - batch_start_time
             
             # Batch sonuçlarını yazdır
-            if args.wasserstein:
-                print(f"Batch {i+1} - Recon Loss: {recon_loss.item():.4f}, IoU: {batch_iou:.4f}, "
-                      f"D Loss: {d_loss.item():.4f}, D Accuracy: {d_accuracy:.4f}, "
-                      f"Time: {batch_time:.2f}s")
-                
-                with open(results_file, 'a') as f:
-                    f.write(f"{i+1} | {recon_loss.item():.4f} | {batch_iou:.4f} | {d_loss.item():.4f} | {d_accuracy:.4f}\n")
-            else:
-                print(f"Batch {i+1} - Recon Loss: {recon_loss.item():.4f}, IoU: {batch_iou:.4f}, "
-                      f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, Time: {batch_time:.2f}s")
-                
-                with open(results_file, 'a') as f:
-                    f.write(f"{i+1} | {recon_loss.item():.4f} | {batch_iou:.4f} | {precision:.4f} | {recall:.4f} | {f1:.4f}\n")
+            print(f"Batch {i+1} - IoU: {batch_iou:.4f}, F-Score: {batch_f_score:.4f}, CD: {batch_cd:.4f}, Time: {batch_time:.2f}s")
+            
+            with open(results_file, 'a', encoding='utf-8') as f:
+                f.write(f"{i+1} | {recon_loss.item():.4f} | {batch_iou:.4f} | {batch_f_score:.4f} | {batch_cd:.4f} | {d_loss.item():.4f} | {d_accuracy:.4f}\n")
             
             # Görselleştirmek için ilk 5 batch'in görüntülerini kaydet
             if i < 5:
@@ -244,6 +242,8 @@ def test_3DVAEGAN(args):
     if batch_count > 0:
         avg_recon_loss = total_recon_loss / batch_count
         avg_iou = total_iou / batch_count
+        avg_f_score = total_f_score / batch_count
+        avg_cd = total_cd / batch_count
         avg_d_loss = total_d_loss / batch_count
         avg_d_accuracy = total_d_accuracy / batch_count
         
@@ -254,6 +254,8 @@ def test_3DVAEGAN(args):
     else:
         avg_recon_loss = 0
         avg_iou = 0
+        avg_f_score = 0
+        avg_cd = 0
         avg_d_loss = 0
         avg_d_accuracy = 0
         
@@ -271,6 +273,8 @@ def test_3DVAEGAN(args):
     print("=" * 50)
     print(f"Ortalama Recon Loss: {avg_recon_loss:.4f}")
     print(f"Ortalama IoU: {avg_iou:.4f}")
+    print(f"Ortalama F-Score: {avg_f_score:.4f}")
+    print(f"Ortalama Chamfer Distance: {avg_cd:.4f}")
     print(f"Ortalama D Loss: {avg_d_loss:.4f}")
     print(f"Ortalama D Accuracy: {avg_d_accuracy:.4f}")
     
@@ -289,6 +293,8 @@ def test_3DVAEGAN(args):
         f.write("=" * 50 + "\n")
         f.write(f"Ortalama Recon Loss: {avg_recon_loss:.4f}\n")
         f.write(f"Ortalama IoU: {avg_iou:.4f}\n")
+        f.write(f"Ortalama F-Score: {avg_f_score:.4f}\n")
+        f.write(f"Ortalama Chamfer Distance: {avg_cd:.4f}\n")
         f.write(f"Ortalama D Loss: {avg_d_loss:.4f}\n")
         f.write(f"Ortalama D Accuracy: {avg_d_accuracy:.4f}\n")
         
