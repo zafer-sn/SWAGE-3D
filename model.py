@@ -51,9 +51,9 @@ class _G(torch.nn.Module):
         self.use_attention = args.use_attention if hasattr(args, 'use_attention') else True
         self.attention_after = args.attention_after if hasattr(args, 'attention_after') else 3  # Hangi katmandan sonra attention uygulanacak
 
-        padd = (1, 1, 1) # Her iki cozunurluk icin de padding 1 olmali
-        # if self.cube_len == 32:
-        #    padd = (1,1,1)
+        padd = (0, 0, 0)
+        if self.cube_len == 32:
+            padd = (1,1,1)
 
         self.layer1 = torch.nn.Sequential(
             torch.nn.ConvTranspose3d(self.args.z_size, self.cube_len*8, kernel_size=4, stride=2, bias=args.bias, padding=padd),
@@ -71,38 +71,19 @@ class _G(torch.nn.Module):
             torch.nn.ReLU()
         )
         
-        # Attention katmanı tanımlama
+        # Attention katmanı ekleme
         if self.use_attention:
             self.attention = SelfAttention(self.cube_len*2, use_spectral_norm=args.use_spectral_norm if hasattr(args, 'use_spectral_norm') else False)
         
-        # 64^3 için ekstra katman gerekebilir veya mevcut katmanların stride/padding ayarlanmalı.
-        # Eğer cube_len 32 ise 5 katman 32'ye ulaşır. 64 için bir katman daha ekleyelim.
-        if self.cube_len == 64:
-             self.layer4 = torch.nn.Sequential(
-                torch.nn.ConvTranspose3d(self.cube_len*2, self.cube_len, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1)),
-                torch.nn.BatchNorm3d(self.cube_len),
-                torch.nn.ReLU()
-            )
-             self.layer5 = torch.nn.Sequential(
-                torch.nn.ConvTranspose3d(self.cube_len, self.cube_len // 2, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1)),
-                torch.nn.BatchNorm3d(self.cube_len // 2),
-                torch.nn.ReLU()
-            )
-             self.layer6 = torch.nn.Sequential(
-                torch.nn.ConvTranspose3d(self.cube_len // 2, 1, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1)),
-                torch.nn.Sigmoid()
-            )
-        else:
-            # Orijinal 32^3 yapısı
-            self.layer4 = torch.nn.Sequential(
-                torch.nn.ConvTranspose3d(self.cube_len*2, self.cube_len, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1)),
-                torch.nn.BatchNorm3d(self.cube_len),
-                torch.nn.ReLU()
-            )
-            self.layer5 = torch.nn.Sequential(
-                torch.nn.ConvTranspose3d(self.cube_len, 1, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1)),
-                torch.nn.Sigmoid()
-            )
+        self.layer4 = torch.nn.Sequential(
+            torch.nn.ConvTranspose3d(self.cube_len*2, self.cube_len, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1)),
+            torch.nn.BatchNorm3d(self.cube_len),
+            torch.nn.ReLU()
+        )
+        self.layer5 = torch.nn.Sequential(
+            torch.nn.ConvTranspose3d(self.cube_len, 1, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1)),
+            torch.nn.Sigmoid()
+        )
 
     def forward(self, x):
         out = x.view(-1, self.args.z_size, 1, 1, 1)
@@ -116,9 +97,6 @@ class _G(torch.nn.Module):
             
         out = self.layer4(out)
         out = self.layer5(out)
-        
-        if self.cube_len == 64:
-            out = self.layer6(out)
 
         return out
 
@@ -132,7 +110,7 @@ class _D(torch.nn.Module):
         self.use_spectral_norm = args.use_spectral_norm  # Yeni parametre
 
         padd = (0,0,0)
-        if self.cube_len in [32, 64]:
+        if self.cube_len == 32:
             padd = (1,1,1)
 
         # Spectral Normalization kullanılıyorsa
@@ -154,15 +132,8 @@ class _D(torch.nn.Module):
                 spectral_norm(torch.nn.Conv3d(self.cube_len*4, self.cube_len*8, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1))),
                 torch.nn.LeakyReLU(self.args.leak_value)
             )
-            
-            if self.cube_len == 64:
-                self.layer_extra = torch.nn.Sequential(
-                    spectral_norm(torch.nn.Conv3d(self.cube_len*8, self.cube_len*16, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1))),
-                    torch.nn.LeakyReLU(self.args.leak_value)
-                )
-                self.layer5 = spectral_norm(torch.nn.Conv3d(self.cube_len*16, 1, kernel_size=4, stride=2, bias=args.bias, padding=padd))
-            else:
-                self.layer5 = spectral_norm(torch.nn.Conv3d(self.cube_len*8, 1, kernel_size=4, stride=2, bias=args.bias, padding=padd))
+            # Son katmana da spectral normalizasyon uygula
+            self.layer5 = spectral_norm(torch.nn.Conv3d(self.cube_len*8, 1, kernel_size=4, stride=2, bias=args.bias, padding=padd))
         else:
             # Orijinal model BatchNorm ile
             self.layer1 = torch.nn.Sequential(
@@ -185,16 +156,8 @@ class _D(torch.nn.Module):
                 torch.nn.BatchNorm3d(self.cube_len*8),
                 torch.nn.LeakyReLU(self.args.leak_value)
             )
-            
-            if self.cube_len == 64:
-                 self.layer_extra = torch.nn.Sequential(
-                    torch.nn.Conv3d(self.cube_len*8, self.cube_len*16, kernel_size=4, stride=2, bias=args.bias, padding=(1, 1, 1)),
-                    torch.nn.BatchNorm3d(self.cube_len*16),
-                    torch.nn.LeakyReLU(self.args.leak_value)
-                )
-                 self.layer5 = torch.nn.Conv3d(self.cube_len*16, 1, kernel_size=4, stride=2, bias=args.bias, padding=padd)
-            else:
-                self.layer5 = torch.nn.Conv3d(self.cube_len*8, 1, kernel_size=4, stride=2, bias=args.bias, padding=padd)
+            # WGAN için son katmanda sigmoid kullanmıyoruz
+            self.layer5 = torch.nn.Conv3d(self.cube_len*8, 1, kernel_size=4, stride=2, bias=args.bias, padding=padd)
 
     def forward(self, x):
         out = x.view(-1, 1, self.args.cube_len, self.args.cube_len, self.args.cube_len)
@@ -202,10 +165,6 @@ class _D(torch.nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        
-        if self.cube_len == 64:
-            out = self.layer_extra(out)
-            
         out = self.layer5(out)
         
         return out
@@ -216,19 +175,22 @@ class _E(torch.nn.Module):
         super(_E, self).__init__()
         self.args = args
         self.z_size = args.z_size
-        self.input_channels = getattr(args, 'input_channels', 4)
+        self.use_depth = args.use_depth if hasattr(args, 'use_depth') else True
         
         # ResNet18 modelini yükle
         resnet = models.resnet18(weights=torchvision.models.ResNet18_Weights.DEFAULT)
         
-        # Giriş katmanını kanallara uygun hale getir
-        self.conv1 = torch.nn.Conv2d(self.input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # Giriş kanal sayısını belirle
+        in_channels = 4 if self.use_depth else 3
+        
+        # İlk katmanı giriş kanal sayısına uygun hale getir (RGB + depth veya sadece RGB)
+        self.conv1 = torch.nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         
         # Conv1 katmanının ağırlıklarını başlatma
         with torch.no_grad():
             self.conv1.weight[:, :3] = resnet.conv1.weight
-            if self.input_channels == 4:
-                # 4. kanalı (depth) için RGB kanallarının ortalamasını kullan
+            # 4. kanalı (depth) varsa, RGB kanallarının ortalamasını kullanarak başlat
+            if self.use_depth:
                 self.conv1.weight[:, 3] = resnet.conv1.weight.mean(dim=1, keepdim=True).squeeze(1)
         
         # ResNet18'in diğer katmanlarını kullan
@@ -246,9 +208,12 @@ class _E(torch.nn.Module):
         self.fc_var = torch.nn.Linear(512, self.z_size)
     
     def forward(self, x):
+        # Beklenen kanal sayısını belirle
+        expected_channels = 4 if self.use_depth else 3
+        
         # Giriş boyutunu kontrol et
-        if x.dim() != 4 or x.size(1) != self.input_channels:
-            raise ValueError(f"Beklenmeyen giriş boyutu: {x.shape}. Beklenen: [batch_size, {self.input_channels}, H, W]")
+        if x.dim() != 4 or x.size(1) != expected_channels:
+            raise ValueError(f"Beklenmeyen giriş boyutu: {x.shape}. Beklenen: [batch_size, {expected_channels}, H, W]")
         
         # Batch boyutunu dinamik olarak al
         batch_size = x.size(0)

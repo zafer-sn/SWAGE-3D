@@ -7,12 +7,8 @@ from test_3DVAEGAN import test_3DVAEGAN
 from test_ensemble_3DVAEGAN import test_ensemble_3DVAEGAN
 from test_best_samples_3DVAEGAN import test_best_samples_3DVAEGAN  # Newly added best samples test
 import torch
-from utils import print_options
 
 def main(args):
-    # Seçenekleri yazdır
-    print_options(args)
-    
     # Configure cuDNN optimizations
     if torch.cuda.is_available():
         # In training mode, use benchmark=True to select the fastest algorithms
@@ -59,7 +55,7 @@ def str2bool(v):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # Model Parmeters
-    parser.add_argument('--n_epochs', type=int, default=150,
+    parser.add_argument('--n_epochs', type=float, default=150,
                         help='max epochs')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='each batch size')
@@ -73,7 +69,7 @@ if __name__ == '__main__':
                         help='beta for adam')
     parser.add_argument('--d_thresh', type=float, default=0.8,
                         help='for balance dsicriminator and generator')
-    parser.add_argument('--z_size', type=int, default=200,
+    parser.add_argument('--z_size', type=float, default=200,
                         help='latent space size')
     parser.add_argument('--z_dis', type=str, default="norm", choices=["norm", "uni"],
                         help='uniform: uni, normal: norm')
@@ -81,18 +77,14 @@ if __name__ == '__main__':
                         help='using cnn bias')
     parser.add_argument('--leak_value', type=float, default=0.2,
                         help='leakeay relu')
-    parser.add_argument('--cube_len', type=int, default=32,
+    parser.add_argument('--cube_len', type=float, default=32,
                         help='cube length')
-    parser.add_argument('--image_size', type=int, default=224,
+    parser.add_argument('--image_size', type=float, default=224,
                         help='cube length')
-    parser.add_argument('--input_channels', type=int, default=4,
-                        help='number of input channels (3 for RGB, 4 for RGB+Depth)')
     parser.add_argument('--obj', type=str, default="watercraft",
                         help='tranining dataset object category')
     parser.add_argument('--soft_label', type=str2bool, default=True,
                         help='using soft_label')
-    parser.add_argument('--voxel_threshold', type=float, default=0.5,
-                        help='threshold for voxel binarization (IoU/F-Score calculation)')
     parser.add_argument('--lrsh', type=str2bool, default=True,
                         help='for learning rate shecduler')
 
@@ -114,7 +106,7 @@ if __name__ == '__main__':
                         help='Warmup epoch sayısı')
     
     # Ensemble test parametreleri
-    parser.add_argument('--use_ensemble', type=str2bool, default=False,
+    parser.add_argument('--use_ensemble', type=str2bool, default=True,
                         help='Ensemble test yaklaşımı kullan')
     parser.add_argument('--ensemble_epochs', type=str, default='129,139,149',
                         help='Ensemble için kullanılacak epoklar (virgülle ayrılmış)')
@@ -132,6 +124,11 @@ if __name__ == '__main__':
                         help='Generator için attention mekanizması kullan')
     parser.add_argument('--attention_after', type=int, default=3,
                         help='Hangi katmandan sonra attention uygulanacak (1-4)')
+
+    # Ablation study için yeni parametre
+    parser.add_argument('--use_depth', type=str2bool, default=True,
+                        help='Depth kanalını kullan (True: RGBD, False: RGB)')
+
     
     # Wasserstein GAN parametreleri
     parser.add_argument('--wasserstein', type=str2bool, default=True,
@@ -144,19 +141,15 @@ if __name__ == '__main__':
                         help='WGAN için critic iterasyon sayısı')
     parser.add_argument('--lambda_gp', type=float, default=10.0,
                         help='WGAN-GP için gradient penalty ağırlığı (SN kullanılıyorsa otomatik olarak 1.0 değerine düşürülür)')
-    parser.add_argument('--lambda_recon', type=float, default=1.0,
-                        help='Reconstruction loss weight for generator')
-    parser.add_argument('--lambda_kl', type=float, default=1.0,
-                        help='KL divergence loss weight for VAE')
 
     # Spectral Normalization parametresi ekleme
     parser.add_argument('--use_spectral_norm', type=str2bool, default=True,
                         help='Discriminator için Spectral Normalization kullan')
 
     # dir parameters
-    parser.add_argument('--output_dir', type=str, default="D:/swage3d_new_yeni",
+    parser.add_argument('--output_dir', type=str, default="output",
                         help='output path')
-    parser.add_argument('--input_dir', type=str, default='input2',
+    parser.add_argument('--input_dir', type=str, default='input',
                         help='input path')
     parser.add_argument('--pickle_dir', type=str, default='/pickle/',
                         help='input path')
@@ -189,7 +182,7 @@ if __name__ == '__main__':
                         help='using tensorboard logging')
     parser.add_argument('--test_iter', type=int, default=10,
                         help='test_epoch number')
-    parser.add_argument('--test', type=str2bool, default=False,
+    parser.add_argument('--test', type=str2bool, default=True,
                         help='for test')
 
     # Yeni optimizasyon parametreleri
@@ -218,7 +211,7 @@ if __name__ == '__main__':
                         help='MixUp uygulanma olasılığı')
 
     # Makalem için en iyi örnekleri test etme parametresi
-    parser.add_argument('--test_best_samples', type=str2bool, default=False,
+    parser.add_argument('--test_best_samples', type=str2bool, default=True,
                         help='En iyi örnekleri test et ve makale için görselleştir')
     parser.add_argument('--num_best_samples', type=int, default=10,
                         help='Kaç tane en iyi örneği seçip görselleştireceğiz')
@@ -239,3 +232,4 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     main(args)
+

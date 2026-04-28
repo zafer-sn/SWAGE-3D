@@ -57,37 +57,43 @@ def save_input_images(input_tensor, save_rgb_path, save_depth_path):
     try:
         # RGB kanallarını ayır (ilk 3 kanal)
         rgb_img = input_tensor[:3].permute(1, 2, 0)
-        depth_img = input_tensor[3].unsqueeze(0)
+        
+        # Depth kanalı var mı kontrol et
+        has_depth = input_tensor.shape[0] > 3
         
         # ImageNet normalizasyonunu geri al
         rgb_mean = torch.tensor([0.485, 0.456, 0.406])
         rgb_std = torch.tensor([0.229, 0.224, 0.225])
         rgb_img = rgb_img * rgb_std + rgb_mean
         
-        # Depth normalizasyonunu geri al
-        depth_mean = torch.tensor([0.330])
-        depth_std = torch.tensor([0.236])
-        depth_img = depth_img * depth_std + depth_mean
-        
         # [0, 1] aralığına sıkıştır
         rgb_img = torch.clamp(rgb_img, 0, 1)
-        depth_img = torch.clamp(depth_img, 0, 1)
         
         # RGB görüntüyü kaydet
         rgb_np = (rgb_img.numpy() * 255).astype(np.uint8)
         rgb_pil = Image.fromarray(rgb_np)
         rgb_pil.save(save_rgb_path)
         
-        # Depth görüntüyü kaydet - Önce normalize edip 0-255 aralığına getir
-        depth_np = (depth_img.numpy()[0] * 255).astype(np.uint8)
+        if has_depth:
+            depth_img = input_tensor[3].unsqueeze(0)
+            
+            # Depth normalizasyonunu geri al
+            depth_mean = torch.tensor([0.330])
+            depth_std = torch.tensor([0.236])
+            depth_img = depth_img * depth_std + depth_mean
+            
+            depth_img = torch.clamp(depth_img, 0, 1)
+            
+            # Depth görüntüyü kaydet - Önce normalize edip 0-255 aralığına getir
+            depth_np = (depth_img.numpy()[0] * 255).astype(np.uint8)
+            
+            # Depth'i jet colormap ile görselleştir
+            colored_depth = cm.plasma(depth_np.astype(float) / 255.0)
+            colored_depth = (colored_depth[:, :, :3] * 255).astype(np.uint8)
+            depth_pil = Image.fromarray(colored_depth)
+            depth_pil.save(save_depth_path)
         
-        # Depth'i jet colormap ile görselleştir
-        colored_depth = cm.plasma(depth_np.astype(float) / 255.0)
-        colored_depth = (colored_depth[:, :, :3] * 255).astype(np.uint8)
-        depth_pil = Image.fromarray(colored_depth)
-        depth_pil.save(save_depth_path)
-        
-        print(f"RGB ve Depth görüntüleri kaydedildi: {save_rgb_path}, {save_depth_path}")
+        print(f"RGB {'ve Depth ' if has_depth else ''}görüntüleri kaydedildi: {save_rgb_path}")
         return True
         
     except Exception as e:
@@ -264,36 +270,46 @@ def create_high_quality_visualization(input_image, generated_voxel, gt_voxel, io
     
     # Extract RGB channels (first 3 channels)
     rgb_img = input_image[:3].permute(1, 2, 0)
-    depth_img = input_image[3].unsqueeze(0).permute(1, 2, 0)
+    
+    # Depth kanalı var mı kontrol et
+    has_depth = input_image.shape[0] > 3
     
     # De-normalization (revert ImageNet normalization)
     rgb_mean = torch.tensor([0.485, 0.456, 0.406])
     rgb_std = torch.tensor([0.229, 0.224, 0.225])
     rgb_img = rgb_img * rgb_std + rgb_mean
     
-    # De-normalize depth map
-    depth_mean = torch.tensor([0.330])
-    depth_std = torch.tensor([0.236])
-    depth_img = depth_img * depth_std + depth_mean
-    
     # Clamp values to [0, 1] range
     rgb_img = torch.clamp(rgb_img, 0, 1)
-    depth_img = torch.clamp(depth_img, 0, 1)
     
     # Display images
     ax_rgb.imshow(rgb_img)
     ax_rgb.set_title("Input: RGB Image", fontsize=14, color=COLOR_PALETTE['text'], fontweight='bold')
     ax_rgb.axis('off')
     
-    # Display depth map as a heatmap with a more appealing colormap
-    depth_cmap = plt.cm.plasma
-    depth_plot = ax_depth.imshow(depth_img.squeeze(), cmap=depth_cmap)
-    ax_depth.set_title("Input: Depth Map", fontsize=14, color=COLOR_PALETTE['text'], fontweight='bold')
-    ax_depth.axis('off')
-    
-    # Add color bar for depth map
-    cbar = plt.colorbar(depth_plot, ax=ax_depth, orientation='vertical', shrink=0.8)
-    cbar.ax.set_ylabel('Depth', rotation=270, labelpad=15)
+    if has_depth:
+        depth_img = input_image[3].unsqueeze(0).permute(1, 2, 0)
+        
+        # De-normalize depth map
+        depth_mean = torch.tensor([0.330])
+        depth_std = torch.tensor([0.236])
+        depth_img = depth_img * depth_std + depth_mean
+        depth_img = torch.clamp(depth_img, 0, 1)
+        
+        # Display depth map as a heatmap with a more appealing colormap
+        depth_cmap = plt.cm.plasma
+        depth_plot = ax_depth.imshow(depth_img.squeeze(), cmap=depth_cmap)
+        ax_depth.set_title("Input: Depth Map", fontsize=14, color=COLOR_PALETTE['text'], fontweight='bold')
+        ax_depth.axis('off')
+        
+        # Add color bar for depth map
+        cbar = plt.colorbar(depth_plot, ax=ax_depth, orientation='vertical', shrink=0.8)
+        cbar.ax.set_ylabel('Depth', rotation=270, labelpad=15)
+    else:
+        # Depth yoksa boş göster veya mesaj yaz
+        ax_depth.text(0.5, 0.5, "No Depth Channel", ha='center', va='center', fontsize=12)
+        ax_depth.set_title("Input: Depth Map", fontsize=14, color=COLOR_PALETTE['text'], fontweight='bold')
+        ax_depth.axis('off')
     
     # Bottom row - 3D Models
     ax_generated = plt.subplot(gs[1, 0], projection='3d', facecolor=COLOR_PALETTE['background'])

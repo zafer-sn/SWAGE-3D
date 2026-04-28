@@ -4,7 +4,6 @@ from torch import nn
 from collections import OrderedDict
 from utils import make_hyparam_string, save_new_pickle, read_pickle, SavePloat_Voxels, generateZ
 from utils import calculate_iou, calculate_metrics, calculate_accuracy_for_wasserstein
-from utils import calculate_reconstruction_fscore, calculate_chamfer_distance_voxels
 from utils import calculate_wasserstein_loss_d, calculate_wasserstein_loss_g
 import os
 import time
@@ -42,10 +41,7 @@ def test_ensemble_3DVAEGAN(args):
     print(f"Test parametreleri: {log_param}")
     
     # Ensemble için kullanılacak checkpoint epokları
-    try:
-        ensemble_epochs = [int(e) for e in args.ensemble_epochs.split(',')]
-    except:
-        ensemble_epochs = [149]
+    ensemble_epochs = [129, 139, 149]  # 30-60-90 milestonelardan sonraki epoklar
     print(f"Ensemble için kullanılacak epoklar: {ensemble_epochs}")
     
     # Test dataset yükleme
@@ -136,14 +132,8 @@ def test_ensemble_3DVAEGAN(args):
     total_recon_loss = 0
     total_ensemble_iou = 0
     total_weighted_iou = 0
-    total_ensemble_f_score = 0
-    total_weighted_f_score = 0
-    total_ensemble_cd = 0
-    total_weighted_cd = 0
     total_best_iou = 0
-    
     individual_ious = {model["epoch"]: 0 for model in ensemble_models}
-    individual_f_scores = {model["epoch"]: 0 for model in ensemble_models}
     individual_counts = {model["epoch"]: 0 for model in ensemble_models}
     
     # Test verisi üzerinde değerlendirme
@@ -191,10 +181,8 @@ def test_ensemble_3DVAEGAN(args):
                     Z_vae = E.reparameterize(z_mu, z_var)
                     G_vae = G(Z_vae)
                     
-                    # IoU ve F-Score hesapla
-                    batch_iou = calculate_iou(G_vae, X_reshaped, threshold=args.voxel_threshold)
-                    batch_f_score = calculate_reconstruction_fscore(G_vae, X_reshaped, threshold=args.voxel_threshold)
-                    
+                    # IoU hesapla
+                    batch_iou = calculate_iou(G_vae, X_reshaped, threshold=0.5)
                     individual_batch_ious[epoch] = batch_iou
                     
                     # En iyi modeli izle
@@ -204,83 +192,197 @@ def test_ensemble_3DVAEGAN(args):
                     
                     # İstatistikleri güncelle
                     individual_ious[epoch] += batch_iou
-                    individual_f_scores[epoch] += batch_f_score
                     individual_counts[epoch] += 1
                 
                 # Rekonstrüksiyonu kaydet
                 all_reconstructions.append(G_vae)
             
             # Ensemble yaklaşımları
-            # 1. Ortalama birleştirme (Simple Average Ensemble) - Bilimsel Standart
+            # 1. Ortalama birleştirme (Average Ensemble)
             ensemble_reconstruction = torch.mean(torch.stack(all_reconstructions), dim=0)
+            ensemble_iou = calculate_iou(ensemble_reconstruction, X_reshaped, threshold=0.5)
             
-            # 2. Epok Ağırlıklı Birleştirme (Epoch-Weighted Ensemble)
-            # Daha geç eğitilmiş modeller genellikle daha iyidir, bu yüzden onlara sabit daha fazla ağırlık verilir.
-            # Bu yöntem GT (Ground Truth) gerektirmediği için bilimsel olarak geçerlidir.
-            weights = torch.linspace(0.8, 1.2, len(ensemble_models)).to(device='cuda' if torch.cuda.is_available() else 'cpu')
-            weights = weights / weights.sum()
-            weighted_reconstruction = torch.sum(torch.stack([w * rec for w, rec in zip(weights, all_reconstructions)]), dim=0)
+            # 2. Ağırlıklı ortalama - IoU ile ağırlıklandırılmış (Weighted Ensemble)
+            if sum(individual_batch_ious.values()) > 0:
+                weights = [iou / sum(individual_batch_ious.values()) for iou in individual_batch_ious.values()]
+                weighted_reconstruction = torch.sum(torch.stack([w * rec for w, rec in zip(weights, all_reconstructions)]), dim=0)
+            else:
+                # IoU değerleri 0 ise eşit ağırlık kullan
+                weighted_reconstruction = ensemble_reconstruction
             
-            # Metrikleri Hesapla (Thresholding sonrası)
-            ensemble_iou = calculate_iou(ensemble_reconstruction, X_reshaped, threshold=args.voxel_threshold)
-            ensemble_f_score = calculate_reconstruction_fscore(ensemble_reconstruction, X_reshaped, threshold=args.voxel_threshold)
-            ensemble_cd = calculate_chamfer_distance_voxels(ensemble_reconstruction, X_reshaped, threshold=args.voxel_threshold)
+            weighted_iou = calculate_iou(weighted_reconstruction, X_reshaped, threshold=0.5)
             
-            weighted_iou = calculate_iou(weighted_reconstruction, X_reshaped, threshold=args.voxel_threshold)
-            weighted_f_score = calculate_reconstruction_fscore(weighted_reconstruction, X_reshaped, threshold=args.voxel_threshold)
-            weighted_cd = calculate_chamfer_distance_voxels(weighted_reconstruction, X_reshaped, threshold=args.voxel_threshold)
+            # 3. En iyi model seçimi (Best Model Selection)
+            best_reconstruction = all_reconstructions[best_model_idx]
             
             # Metrikleri güncelle
             total_ensemble_iou += ensemble_iou
             total_weighted_iou += weighted_iou
-            total_ensemble_f_score += ensemble_f_score
-            total_weighted_f_score += weighted_f_score
-            total_ensemble_cd += ensemble_cd
-            total_weighted_cd += weighted_cd
             total_best_iou += best_batch_iou
             batch_count += 1
             
             # Batch sonuçlarını yazdır
-            print(f"Batch {i+1} - Average Ens. IoU: {ensemble_iou:.4f}, CD: {ensemble_cd:.4f}")
+            batch_time = time.time() - batch_start_time
+            print(f"Batch {i+1} - Ensemble IoU: {ensemble_iou:.4f}, Weighted IoU: {weighted_iou:.4f}, "
+                  f"Best IoU: {best_batch_iou:.4f} (Epok {ensemble_models[best_model_idx]['epoch']}), "
+                  f"Time: {batch_time:.2f}s")
             
-            # Sonuçları dosyaya yaz (UTF-8)
-            with open(results_file, 'a', encoding='utf-8') as f:
-                f.write(f"Batch {i+1}: Avg.IoU: {ensemble_iou:.4f}, Weighted.IoU: {weighted_iou:.4f}, CD: {ensemble_cd:.4f}\n")
+            # Sonuçları dosyaya yaz
+            with open(results_file, 'a') as f:
+                f.write(f"Batch {i+1}: Ensemble IoU: {ensemble_iou:.4f}, Weighted IoU: {weighted_iou:.4f}, "
+                        f"Best IoU: {best_batch_iou:.4f} (Epok {ensemble_models[best_model_idx]['epoch']})\n")
+                for epoch, iou in individual_batch_ious.items():
+                    f.write(f"  - Epok {epoch}: IoU = {iou:.4f}\n")
+                f.write("\n")
+            
+            # İlk 5 batch için görselleştirme kaydet
+            if i < 5:
+                # Görselleştirme için örnek seç (batch'in ilk örneği)
+                sample_idx = 0
+                
+                # Her model için ayrı görselleştirme
+                for idx, model_data in enumerate(ensemble_models):
+                    epoch = model_data["epoch"]
+                    sample_reconstruction = all_reconstructions[idx][sample_idx].cpu().squeeze().numpy()
+                    SavePloat_Voxels(
+                        np.array([sample_reconstruction]), 
+                        f"{visualization_dir}/batch_{i+1}_epoch_{epoch}", 
+                        0
+                    )
+                
+                # Ensemble sonuçları
+                ensemble_sample = ensemble_reconstruction[sample_idx].cpu().squeeze().numpy()
+                weighted_sample = weighted_reconstruction[sample_idx].cpu().squeeze().numpy()
+                ground_truth = X_reshaped[sample_idx].cpu().squeeze().numpy()
+                
+                SavePloat_Voxels(
+                    np.array([ground_truth, ensemble_sample, weighted_sample]), 
+                    f"{visualization_dir}/batch_{i+1}_ensemble", 
+                    0,
+                    titles=["Ground Truth", "Average Ensemble", "Weighted Ensemble"]
+                )
+                
+                # Görselleştirme klasörü
+                comparative_vis_dir = os.path.join(visualization_dir, "comparative")
+                if not os.path.exists(comparative_vis_dir):
+                    os.makedirs(comparative_vis_dir)
+                
+                # Batch'in ilk 2 örneğini görselleştir (daha fazla bilgi gösteriliyor, bu nedenle daha az örnek)
+                max_samples = min(2, X.size(0))
+                
+                for j in range(max_samples):
+                    # Örnek veri hazırlama
+                    input_image = image[j].cpu()  # 2D input görüntü
+                    ensemble_voxel = ensemble_reconstruction[j].cpu().squeeze().numpy()  # Ensemble output
+                    ground_truth_voxel = X_reshaped[j].cpu().squeeze().numpy()  # Ground truth
+                    
+                    # Görsel oluştur ve kaydet
+                    fig_path = os.path.join(comparative_vis_dir, f"comparison_batch{i+1}_sample{j+1}.png")
+                    
+                    # Önce standart görselleştirme
+                    visualize_comparative_results(
+                        input_image, 
+                        ensemble_voxel, 
+                        ground_truth_voxel,
+                        save_path=fig_path,
+                        title=f"Ensemble - Batch {i+1}, Sample {j+1} - IoU: {ensemble_iou:.4f}"
+                    )
+                    
+                    # Her model için ayrı görselleştirme yap
+                    for idx, model_data in enumerate(ensemble_models):
+                        epoch = model_data["epoch"]
+                        model_output = all_reconstructions[idx][j].cpu().squeeze().numpy()
+                        model_iou = individual_batch_ious[epoch]
+                        
+                        model_fig_path = os.path.join(comparative_vis_dir, f"comparison_batch{i+1}_sample{j+1}_model{epoch}.png")
+                        visualize_comparative_results(
+                            input_image,
+                            model_output,
+                            ground_truth_voxel,
+                            save_path=model_fig_path,
+                            title=f"Model Epoch {epoch} - Batch {i+1}, Sample {j+1} - IoU: {model_iou:.4f}"
+                        )
+    
+    # Toplam test süresini hesapla
+    total_test_time = time.time() - test_start_time
     
     # Ortalama metrikleri hesapla
     if batch_count > 0:
         avg_ensemble_iou = total_ensemble_iou / batch_count
         avg_weighted_iou = total_weighted_iou / batch_count
-        avg_ensemble_f_score = total_ensemble_f_score / batch_count
-        avg_weighted_f_score = total_weighted_f_score / batch_count
-        avg_ensemble_cd = total_ensemble_cd / batch_count
-        avg_weighted_cd = total_weighted_cd / batch_count
         avg_best_iou = total_best_iou / batch_count
         
-        # Her epok için ortalama metrikler
-        avg_individual_ious = {epoch: total/individual_counts[epoch] for epoch, total in individual_ious.items()}
-        avg_individual_f_scores = {epoch: total/individual_counts[epoch] for epoch, total in individual_f_scores.items()}
+        # Her epok için ortalama IoU
+        avg_individual_ious = {epoch: total/individual_counts[epoch] if individual_counts[epoch] > 0 else 0 
+                               for epoch, total in individual_ious.items()}
+    else:
+        avg_ensemble_iou = 0
+        avg_weighted_iou = 0
+        avg_best_iou = 0
+        avg_individual_ious = {epoch: 0 for epoch in individual_ious.keys()}
     
-    # Genel sonuçları yazdır
+    # Sonuçları yazdır
     print("\n" + "=" * 60)
-    print("Ensemble Final Sonuçları")
-    print("-" * 60)
-    print(f"Avg Ensemble  - IoU: {avg_ensemble_iou:.4f}, F1: {avg_ensemble_f_score:.4f}, CD: {avg_ensemble_cd:.4f}")
-    print(f"Weighted Ens. - IoU: {avg_weighted_iou:.4f}, F1: {avg_weighted_f_score:.4f}, CD: {avg_weighted_cd:.4f}")
+    print("Ensemble Test Sonuçları")
+    print("=" * 60)
+    print(f"Ensemble Modelleri: Epok {ensemble_epochs}")
+    print(f"Ortalama Ensemble IoU: {avg_ensemble_iou:.4f}")
+    print(f"Ortalama Weighted IoU: {avg_weighted_iou:.4f}")
+    print(f"Ortalama Best IoU: {avg_best_iou:.4f}")
+    print("\nBireysel Model Sonuçları:")
+    
+    # En iyi modeli belirle
+    best_epoch = max(avg_individual_ious, key=avg_individual_ious.get)
+    best_single_iou = avg_individual_ious[best_epoch]
+    
+    for epoch, avg_iou in avg_individual_ious.items():
+        print(f"  Epok {epoch}: Ortalama IoU = {avg_iou:.4f}" + 
+              (" (En İyi Model)" if epoch == best_epoch else ""))
+    
+    print(f"\nToplam Test Süresi: {total_test_time:.2f} saniye")
+    print(f"Test Edilen Batch Sayısı: {batch_count}")
     print("=" * 60)
     
     # Sonuçları dosyaya kaydet
     with open(results_file, 'a') as f:
         f.write("\n" + "=" * 60 + "\n")
-        f.write("Ensemble Final Sonuçları\n")
-        f.write(f"Avg Ensemble  - IoU: {avg_ensemble_iou:.4f}, F1: {avg_ensemble_f_score:.4f}, CD: {avg_ensemble_cd:.4f}\n")
-        f.write(f"Weighted Ens. - IoU: {avg_weighted_iou:.4f}, F1: {avg_weighted_f_score:.4f}, CD: {avg_weighted_cd:.4f}\n")
+        f.write("Ensemble Test Sonuçları\n")
         f.write("=" * 60 + "\n")
+        f.write(f"Ortalama Ensemble IoU: {avg_ensemble_iou:.4f}\n")
+        f.write(f"Ortalama Weighted IoU: {avg_weighted_iou:.4f}\n")
+        f.write(f"Ortalama Best IoU: {avg_best_iou:.4f}\n\n")
+        f.write("Bireysel Model Sonuçları:\n")
+        
+        for epoch, avg_iou in avg_individual_ious.items():
+            f.write(f"  Epok {epoch}: Ortalama IoU = {avg_iou:.4f}" + 
+                  (" (En İyi Model)" if epoch == best_epoch else "") + "\n")
+        
+        # Ensemble karşılaştırması
+        f.write("\nEnsemble Karşılaştırması:\n")
+        if avg_weighted_iou > best_single_iou and avg_weighted_iou > avg_ensemble_iou:
+            f.write("  En iyi sonuç: Ağırlıklı Ensemble\n")
+        elif avg_ensemble_iou > best_single_iou:
+            f.write("  En iyi sonuç: Ortalama Ensemble\n")
+        else:
+            f.write(f"  En iyi sonuç: Tek model (Epok {best_epoch})\n")
+        
+        f.write(f"\nToplam Test Süresi: {total_test_time:.2f} saniye\n")
+        f.write(f"Test Edilen Batch Sayısı: {batch_count}\n")
+        f.write(f"Test Tarihi: {test_date}\n")
+        f.write("=" * 60 + "\n")
+    
+    print(f"\nSonuçlar {results_file} dosyasına kaydedildi.")
+    print(f"Görselleştirmeler {visualization_dir} dizinine kaydedildi.")
+    
+    # Sonuçları görselleştir
+    visualize_ensemble_results(avg_individual_ious, avg_ensemble_iou, avg_weighted_iou, results_dir, test_date)
     
     return {
         'ensemble_iou': avg_ensemble_iou,
         'weighted_iou': avg_weighted_iou,
-        'individual_ious': avg_individual_ious
+        'best_iou': avg_best_iou,
+        'individual_ious': avg_individual_ious,
+        'best_epoch': best_epoch
     }
 
 def visualize_ensemble_results(individual_ious, ensemble_iou, weighted_iou, results_dir, test_date):
