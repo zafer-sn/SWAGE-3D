@@ -389,36 +389,120 @@ def calculate_metrics(y_pred, y_true, threshold=0.5):
     
     return precision, recall, f1_score
 
-def get_mixup_params(batch_size, alpha, device):
+def mixup_data(x1, x2, y1, y2, alpha=1.0, device='cuda'):
     """
-    MixUp işlemi için bir lambda oranı ve karıştırma indeksleri üretir.
+    MixUp işlemi için iki örneği belirli bir oranda karıştırır.
+    
+    Args:
+        x1, x2: Karıştırılacak girdi verileri (görüntü veya voxel)
+        y1, y2: Karıştırılacak hedef veriler (etiketler)
+        alpha: Beta dağılımı parametresi
+        device: İşlem yapılacak cihaz (cuda veya cpu)
+        
+    Returns:
+        karıştırılmış girdi, karıştırılmış hedef ve lambda değeri
     """
     if alpha > 0:
+        # Beta dağılımından lambda değeri örnekle
         lam = torch.distributions.beta.Beta(alpha, alpha).sample().to(device)
     else:
         lam = torch.tensor(1.0, device=device)
-    indices = torch.randperm(batch_size, device=device)
-    return lam, indices
-
-def apply_mixup_with_params(x, lam, indices):
-    """
-    Belirli parametrelerle (lambda ve indices) herhangi bir boyuttaki tensöre MixUp uygular.
-    """
-    if x is None:
-        return None
-        
-    # Lambda değerini tensör boyutuna göre yeniden şekillendir
-    if x.dim() == 5:  # 3D voxel (B, C, D, H, W)
+    
+    # Batch boyutlarını kontrol et
+    batch_size = min(x1.size(0), x2.size(0))
+    
+    # Lambda değerini doğru şekilde yeniden şekillendir
+    if x1.dim() == 5:  # 3D voxel tensörleri için (B, C, D, H, W)
         lam_reshaped = lam.view(1, 1, 1, 1, 1)
-    elif x.dim() == 4:  # 2D görüntü (B, C, H, W)
+    elif x1.dim() == 4:  # 2D görüntüler için (B, C, H, W)
         lam_reshaped = lam.view(1, 1, 1, 1)
-    elif x.dim() == 2:  # Latent vektör (B, Z)
+    else:  # Latent vektörler için (B, Z)
         lam_reshaped = lam.view(1, 1)
-    else:
-        lam_reshaped = lam
+    
+    # MixUp uygula
+    mixed_x = lam_reshaped * x1[:batch_size] + (1 - lam_reshaped) * x2[:batch_size]
+    mixed_y = lam * y1[:batch_size] + (1 - lam) * y2[:batch_size]
+    
+    return mixed_x, mixed_y, lam
+
+def apply_2d_mixup(images, alpha=0.2):
+    """
+    Batch içindeki 2D görüntülere MixUp uygular.
+    
+    Args:
+        images: Giriş görüntü batch'i (B, C, H, W)
+        alpha: Beta dağılımı parametresi
         
-    mixed_x = lam_reshaped * x + (1 - lam_reshaped) * x[indices]
-    return mixed_x
+    Returns:
+        Karıştırılmış görüntüler
+    """
+    device = images.device
+    batch_size = images.size(0)
+    
+    # Karışım için permütasyon oluştur (her görüntüyü başka bir görüntüyle eşleştir)
+    indices = torch.randperm(batch_size, device=device)
+    
+    # Görüntüleri karıştır
+    mixed_images, _, _ = mixup_data(images, images[indices], 
+                                  torch.ones(batch_size, device=device), 
+                                  torch.ones(batch_size, device=device), 
+                                  alpha, device)
+    return mixed_images
+
+def apply_3d_mixup(voxels, alpha=0.2):
+    """
+    Batch içindeki 3D voxellere MixUp uygular.
+    
+    Args:
+        voxels: Giriş voxel batch'i (B, C, D, H, W)
+        alpha: Beta dağılımı parametresi
+        
+    Returns:
+        Karıştırılmış voxeller
+    """
+    device = voxels.device
+    batch_size = voxels.size(0)
+    
+    # Karışım için permütasyon oluştur
+    indices = torch.randperm(batch_size, device=device)
+    
+    # Voxelleri karıştır
+    mixed_voxels, _, _ = mixup_data(voxels, voxels[indices], 
+                                   torch.ones(batch_size, device=device), 
+                                   torch.ones(batch_size, device=device), 
+                                   alpha, device)
+    return mixed_voxels
+
+def apply_latent_mixup(z_mu, z_var, alpha=0.3):
+    """
+    Latent uzayda MixUp uygular.
+    
+    Args:
+        z_mu: Ortalama vektörleri
+        z_var: Varyans vektörleri
+        alpha: Beta dağılımı parametresi
+        
+    Returns:
+        Karıştırılmış mu ve var vektörleri
+    """
+    device = z_mu.device
+    batch_size = z_mu.size(0)
+    
+    # Karışım için permütasyon oluştur
+    indices = torch.randperm(batch_size, device=device)
+    
+    # Latent vektörleri karıştır
+    mixed_z_mu, _, _ = mixup_data(z_mu, z_mu[indices], 
+                                torch.ones(batch_size, device=device), 
+                                torch.ones(batch_size, device=device), 
+                                alpha, device)
+    
+    mixed_z_var, _, _ = mixup_data(z_var, z_var[indices], 
+                                 torch.ones(batch_size, device=device), 
+                                 torch.ones(batch_size, device=device), 
+                                 alpha, device)
+    
+    return mixed_z_mu, mixed_z_var
 
 def calculate_wasserstein_loss_d(d_real, d_fake):
     """
