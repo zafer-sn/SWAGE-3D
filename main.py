@@ -124,11 +124,6 @@ if __name__ == '__main__':
                         help='Generator için attention mekanizması kullan')
     parser.add_argument('--attention_after', type=int, default=3,
                         help='Hangi katmandan sonra attention uygulanacak (1-4)')
-
-    # Ablation study için yeni parametre
-    parser.add_argument('--use_depth', type=str2bool, default=True,
-                        help='Depth kanalını kullan (True: RGBD, False: RGB)')
-
     
     # Wasserstein GAN parametreleri
     parser.add_argument('--wasserstein', type=str2bool, default=True,

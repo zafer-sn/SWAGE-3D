@@ -175,23 +175,18 @@ class _E(torch.nn.Module):
         super(_E, self).__init__()
         self.args = args
         self.z_size = args.z_size
-        self.use_depth = args.use_depth if hasattr(args, 'use_depth') else True
         
         # ResNet18 modelini yükle
         resnet = models.resnet18(weights=torchvision.models.ResNet18_Weights.DEFAULT)
         
-        # Giriş kanal sayısını belirle
-        in_channels = 4 if self.use_depth else 3
-        
-        # İlk katmanı giriş kanal sayısına uygun hale getir (RGB + depth veya sadece RGB)
-        self.conv1 = torch.nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # İlk katmanı 4 kanallı girişe uygun hale getir (RGB + depth)
+        self.conv1 = torch.nn.Conv2d(4, 64, kernel_size=7, stride=2, padding=3, bias=False)
         
         # Conv1 katmanının ağırlıklarını başlatma
         with torch.no_grad():
             self.conv1.weight[:, :3] = resnet.conv1.weight
-            # 4. kanalı (depth) varsa, RGB kanallarının ortalamasını kullanarak başlat
-            if self.use_depth:
-                self.conv1.weight[:, 3] = resnet.conv1.weight.mean(dim=1, keepdim=True).squeeze(1)
+            # 4. kanalı (depth) için RGB kanallarının ortalamasını kullan
+            self.conv1.weight[:, 3] = resnet.conv1.weight.mean(dim=1, keepdim=True).squeeze(1)
         
         # ResNet18'in diğer katmanlarını kullan
         self.bn1 = resnet.bn1
@@ -208,12 +203,9 @@ class _E(torch.nn.Module):
         self.fc_var = torch.nn.Linear(512, self.z_size)
     
     def forward(self, x):
-        # Beklenen kanal sayısını belirle
-        expected_channels = 4 if self.use_depth else 3
-        
         # Giriş boyutunu kontrol et
-        if x.dim() != 4 or x.size(1) != expected_channels:
-            raise ValueError(f"Beklenmeyen giriş boyutu: {x.shape}. Beklenen: [batch_size, {expected_channels}, H, W]")
+        if x.dim() != 4 or x.size(1) != 4:
+            raise ValueError(f"Beklenmeyen giriş boyutu: {x.shape}. Beklenen: [batch_size, 4, H, W]")
         
         # Batch boyutunu dinamik olarak al
         batch_size = x.size(0)

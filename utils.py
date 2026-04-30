@@ -208,18 +208,9 @@ class ShapeNetPlusImageDataset(data.Dataset):
         volume = np.array(getVolumeFromBinvox(self.root + model_3d_file), dtype=np.float32).copy()
         
         try:
-            # RGB görüntüyü yükle, RGB formatına çevir (RGBA sorununu çözer) ve normalize et
-            rgb_image = self.rgb_transform(Image.open(self.root + model_2d_file).convert('RGB'))
-            
-            # Depth kullanımı kontrolü (varsayılan: True)
-            use_depth = self.args.use_depth if hasattr(self.args, 'use_depth') else True
-            
-            if not use_depth:
-                # Sadece RGB döndür (3 kanal)
-                return (rgb_image, torch.from_numpy(volume).float())
-            
-            # Depth görüntüyü yükle, Grayscale'e çevir ve normalize et
-            depth_image = self.depth_transform(Image.open(self.root + model_2d_file_depth).convert('L'))
+            # RGB ve depth görüntüleri ayrı ayrı normalize edelim
+            rgb_image = self.rgb_transform(Image.open(self.root + model_2d_file))
+            depth_image = self.depth_transform(Image.open(self.root + model_2d_file_depth))
             
             # Normalize edilmiş RGB ve depth görüntülerini birleştirelim
             combined_image = torch.cat((rgb_image, depth_image), dim=0)
@@ -338,7 +329,6 @@ def save_new_pickle(path, iteration, G, G_solver, D_, D_solver, E_=None,E_solver
 def calculate_iou(pred_voxel, gt_voxel, threshold=0.5):
     """
     3D Voxel tensörler için IoU (Intersection over Union) hesaplar.
-    Batch içindeki her bir örneğin IoU değerini ayrı ayrı hesaplar ve ortalamasını döndürür.
     
     Args:
         pred_voxel: Tahmin edilen voxel tensor
@@ -346,31 +336,29 @@ def calculate_iou(pred_voxel, gt_voxel, threshold=0.5):
         threshold: Tahmin edilen voxel'i binary'ye çevirmek için eşik değeri
         
     Returns:
-        float: Batch ortalama IoU değeri
+        float: IoU değeri
     """
     # Tensörlerin uygun şekilde biçimlendirilmiş olduğundan emin olalım
     if pred_voxel.dim() != gt_voxel.dim():
-        # print(f"Uyarı: Tensör boyutları eşleşmiyor. pred_voxel: {pred_voxel.shape}, gt_voxel: {gt_voxel.shape}")
+        print(f"Uyarı: Tensör boyutları eşleşmiyor. pred_voxel: {pred_voxel.shape}, gt_voxel: {gt_voxel.shape}")
         if pred_voxel.dim() == 5 and gt_voxel.dim() == 4:  # Yaygın bir durum
             gt_voxel = gt_voxel.view(-1, 1, gt_voxel.size(1), gt_voxel.size(2), gt_voxel.size(3))
         elif pred_voxel.dim() == 4 and gt_voxel.dim() == 5:
             pred_voxel = pred_voxel.view(-1, 1, pred_voxel.size(1), pred_voxel.size(2), pred_voxel.size(3))
     
-    # Tahmin edilen voxel'i binary'ye çevirme
+    # Tahmin edilen voxel'i binary'ye çevirme (eşik değerinden büyükse 1, değilse 0)
     pred_binary = (pred_voxel > threshold).float()
-    gt_binary = (gt_voxel > threshold).float()
+    gt_binary = (gt_voxel > threshold).float()  # GT'nin de binary olduğundan emin olalım
     
-    # Batch boyutunu koruyarak toplama yap (dim=1,2,3,4 -> batch boyutu hariç diğer boyutları topla)
-    # Voxel şekli genellikle: [Batch, Channel, D, H, W]
-    intersection = torch.sum(pred_binary * gt_binary, dim=(1, 2, 3, 4))
-    union = torch.sum(torch.clamp(pred_binary + gt_binary, 0, 1), dim=(1, 2, 3, 4))
+    # Kesişim ve birleşim hesaplama
+    intersection = torch.sum(pred_binary * gt_binary).float()
+    union = torch.sum(torch.clamp(pred_binary + gt_binary, 0, 1)).float()
     
-    # Her bir örnek için IoU hesapla
-    # 0'a bölme hatasını önlemek için epsilon ekle
-    iou_per_sample = intersection / (union + 1e-6)
-    
-    # Batch ortalamasını döndür
-    return torch.mean(iou_per_sample).item()
+    # Sıfıra bölme hatasını önlemek için kontrol
+    if union.item() < 1e-6:
+        return 0.0
+        
+    return (intersection / union).item()
 
 def calculate_metrics(y_pred, y_true, threshold=0.5):
     """
@@ -401,28 +389,120 @@ def calculate_metrics(y_pred, y_true, threshold=0.5):
     
     return precision, recall, f1_score
 
-def mixup_data(x, indices, lam, device='cuda'):
+def mixup_data(x1, x2, y1, y2, alpha=1.0, device='cuda'):
     """
-    MixUp işlemi için veriyi verilen indeksler ve lambda ile karıştırır.
+    MixUp işlemi için iki örneği belirli bir oranda karıştırır.
+    
+    Args:
+        x1, x2: Karıştırılacak girdi verileri (görüntü veya voxel)
+        y1, y2: Karıştırılacak hedef veriler (etiketler)
+        alpha: Beta dağılımı parametresi
+        device: İşlem yapılacak cihaz (cuda veya cpu)
+        
+    Returns:
+        karıştırılmış girdi, karıştırılmış hedef ve lambda değeri
     """
+    if alpha > 0:
+        # Beta dağılımından lambda değeri örnekle
+        lam = torch.distributions.beta.Beta(alpha, alpha).sample().to(device)
+    else:
+        lam = torch.tensor(1.0, device=device)
+    
+    # Batch boyutlarını kontrol et
+    batch_size = min(x1.size(0), x2.size(0))
+    
     # Lambda değerini doğru şekilde yeniden şekillendir
-    if x.dim() == 5:  # 3D voxel tensörleri için (B, C, D, H, W)
+    if x1.dim() == 5:  # 3D voxel tensörleri için (B, C, D, H, W)
         lam_reshaped = lam.view(1, 1, 1, 1, 1)
-    elif x.dim() == 4:  # 2D görüntüler için (B, C, H, W)
+    elif x1.dim() == 4:  # 2D görüntüler için (B, C, H, W)
         lam_reshaped = lam.view(1, 1, 1, 1)
     else:  # Latent vektörler için (B, Z)
         lam_reshaped = lam.view(1, 1)
     
-    mixed_x = lam_reshaped * x + (1 - lam_reshaped) * x[indices]
-    return mixed_x
+    # MixUp uygula
+    mixed_x = lam_reshaped * x1[:batch_size] + (1 - lam_reshaped) * x2[:batch_size]
+    mixed_y = lam * y1[:batch_size] + (1 - lam) * y2[:batch_size]
+    
+    return mixed_x, mixed_y, lam
 
-def get_mixup_params(batch_size, alpha, device='cuda'):
-    if alpha > 0:
-        lam = torch.distributions.beta.Beta(alpha, alpha).sample().to(device)
-    else:
-        lam = torch.tensor(1.0, device=device)
+def apply_2d_mixup(images, alpha=0.2):
+    """
+    Batch içindeki 2D görüntülere MixUp uygular.
+    
+    Args:
+        images: Giriş görüntü batch'i (B, C, H, W)
+        alpha: Beta dağılımı parametresi
+        
+    Returns:
+        Karıştırılmış görüntüler
+    """
+    device = images.device
+    batch_size = images.size(0)
+    
+    # Karışım için permütasyon oluştur (her görüntüyü başka bir görüntüyle eşleştir)
     indices = torch.randperm(batch_size, device=device)
-    return lam, indices
+    
+    # Görüntüleri karıştır
+    mixed_images, _, _ = mixup_data(images, images[indices], 
+                                  torch.ones(batch_size, device=device), 
+                                  torch.ones(batch_size, device=device), 
+                                  alpha, device)
+    return mixed_images
+
+def apply_3d_mixup(voxels, alpha=0.2):
+    """
+    Batch içindeki 3D voxellere MixUp uygular.
+    
+    Args:
+        voxels: Giriş voxel batch'i (B, C, D, H, W)
+        alpha: Beta dağılımı parametresi
+        
+    Returns:
+        Karıştırılmış voxeller
+    """
+    device = voxels.device
+    batch_size = voxels.size(0)
+    
+    # Karışım için permütasyon oluştur
+    indices = torch.randperm(batch_size, device=device)
+    
+    # Voxelleri karıştır
+    mixed_voxels, _, _ = mixup_data(voxels, voxels[indices], 
+                                   torch.ones(batch_size, device=device), 
+                                   torch.ones(batch_size, device=device), 
+                                   alpha, device)
+    return mixed_voxels
+
+def apply_latent_mixup(z_mu, z_var, alpha=0.3):
+    """
+    Latent uzayda MixUp uygular.
+    
+    Args:
+        z_mu: Ortalama vektörleri
+        z_var: Varyans vektörleri
+        alpha: Beta dağılımı parametresi
+        
+    Returns:
+        Karıştırılmış mu ve var vektörleri
+    """
+    device = z_mu.device
+    batch_size = z_mu.size(0)
+    
+    # Karışım için permütasyon oluştur
+    indices = torch.randperm(batch_size, device=device)
+    
+    # Latent vektörleri karıştır
+    mixed_z_mu, _, _ = mixup_data(z_mu, z_mu[indices], 
+                                torch.ones(batch_size, device=device), 
+                                torch.ones(batch_size, device=device), 
+                                alpha, device)
+    
+    mixed_z_var, _, _ = mixup_data(z_var, z_var[indices], 
+                                 torch.ones(batch_size, device=device), 
+                                 torch.ones(batch_size, device=device), 
+                                 alpha, device)
+    
+    return mixed_z_mu, mixed_z_var
 
 def calculate_wasserstein_loss_d(d_real, d_fake):
     """
