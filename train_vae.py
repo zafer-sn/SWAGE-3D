@@ -2,7 +2,9 @@ import torch
 from torch import optim
 from torch import nn
 import torch.multiprocessing as mp
+from torch.utils.data import random_split
 from collections import OrderedDict
+import pickle
 from utils import make_hyparam_string, save_new_pickle, read_pickle, SavePloat_Voxels, generateZ, calculate_iou, calculate_metrics
 from utils import calculate_wasserstein_loss_d, calculate_wasserstein_loss_g, compute_gradient_penalty, calculate_accuracy_for_wasserstein
 from utils import get_mixup_params, apply_mixup_with_params
@@ -57,12 +59,17 @@ def train_vae(args):
 
     # Dataloader optimizasyonu
     dsets_path = args.input_dir + args.data_dir + "train/"
-    print(dsets_path)
-    dsets = ShapeNetPlusImageDataset(dsets_path, args)
+    print(f"Veri seti yolu: {dsets_path}")
+    full_dsets = ShapeNetPlusImageDataset(dsets_path, args)
+    
+    # Veriyi %80 train, %20 validation olarak böl
+    train_size = int(0.8 * len(full_dsets))
+    val_size = len(full_dsets) - train_size
+    train_dsets, val_dsets = random_split(full_dsets, [train_size, val_size], generator=torch.Generator().manual_seed(42))
     
     # Optimize edilmiş dataloader ayarları
     dset_loaders = torch.utils.data.DataLoader(
-        dsets, 
+        train_dsets, 
         batch_size=args.batch_size, 
         shuffle=True, 
         num_workers=args.num_workers,
@@ -72,8 +79,19 @@ def train_vae(args):
         drop_last=True
     )
 
+    val_loader = torch.utils.data.DataLoader(
+        val_dsets,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=(args.num_workers > 0),
+        drop_last=False
+    )
+
     # Veri yükleyici uyarısı
-    print(f"Dataloader: {args.num_workers} işçi ile optimize edilmiş veri yükleme aktif")
+    print(f"Dataloader: {args.num_workers} işçi ile optimize edilmiş veri yükleme aktif (Train: {len(train_dsets)}, Val: {len(val_dsets)})")
 
     # model define
     D = _D(args)
@@ -163,6 +181,9 @@ def train_vae(args):
         best_d_loss = float('inf')
         best_g_loss = float('inf')
         best_recon_loss = float('inf')
+
+    # Validation metriklerini takip etmek için
+    val_metrics = {}
 
     for epoch in range(args.n_epochs):
         # GPU belleğini optimize et
@@ -430,6 +451,42 @@ def train_vae(args):
             if args.optimize_memory and i % 10 == 0 and torch.cuda.is_available():
                 print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
+        # =============== Validation Phase ===============#
+        D.eval()
+        G.eval()
+        E.eval()
+        val_epoch_iou = 0
+        val_batch_count = 0
+        
+        with torch.no_grad():
+            for i, (val_image, val_model_3d) in enumerate(val_loader):
+                if args.use_amp:
+                    val_model_3d = val_model_3d.to(device='cuda', non_blocking=True)
+                    val_image = val_image.to(device='cuda', non_blocking=True)
+                else:
+                    val_model_3d = var_or_cuda(val_model_3d)
+                    val_image = var_or_cuda(val_image)
+                
+                val_model_3d_view = val_model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+                
+                with autocast(device_type='cuda', enabled=args.use_amp):
+                    z_mu, z_var = E(val_image)
+                    Z_vae = E.reparameterize(z_mu, z_var)
+                    G_vae = G(Z_vae)
+                    
+                    val_iou = calculate_iou(G_vae, val_model_3d_view)
+                    val_epoch_iou += val_iou
+                    val_batch_count += 1
+        
+        avg_val_iou = val_epoch_iou / val_batch_count if val_batch_count > 0 else 0
+        val_metrics[epoch] = avg_val_iou
+        
+        # Modelleri tekrar eğitim moduna al
+        D.train()
+        G.train()
+        E.train()
+        # ================================================#
+
         # Epoch ortalaması hesaplama
         if batch_count > 0:
             epoch_d_loss /= batch_count
@@ -535,11 +592,12 @@ def train_vae(args):
 
         # =============== each epoch save model or save image ===============#
         if args.wasserstein:
-            print('Epoch-{}, Iter-{}; Duration: {:.2f}s, IoU: {:.4f}, Recon_loss: {:.4f}, KLLoss: {:.4f}, D_loss: {:.4f}, G_loss: {:.4f}, D_acu: {:.4f}'.format(
+            print('Epoch-{}, Iter-{}; Duration: {:.2f}s, IoU: {:.4f}, Val_IoU: {:.4f}, Recon_loss: {:.4f}, KLLoss: {:.4f}, D_loss: {:.4f}, G_loss: {:.4f}, D_acu: {:.4f}'.format(
                 epoch,
                 iteration,
                 epoch_duration,
                 epoch_iou,
+                avg_val_iou,
                 epoch_recon_loss,
                 epoch_kl_loss,
                 epoch_d_loss, 
@@ -550,11 +608,12 @@ def train_vae(args):
             if args.gradient_penalty:
                 print('Gradient Penalty: {:.4f}'.format(epoch_gp))
         else:
-            print('Epoch-{}, Iter-{}; Duration: {:.2f}s, IoU: {:.4f}, Precision: {:.4f}, Recall: {:.4f}, F1: {:.4f}, Recon_loss: {:.4}, KLLoss: {:.4}, D_loss: {:.4}, G_loss: {:.4}, D_acu: {:.4}, D_lr: {:.4}'.format(
+            print('Epoch-{}, Iter-{}; Duration: {:.2f}s, IoU: {:.4f}, Val_IoU: {:.4f}, Precision: {:.4f}, Recall: {:.4f}, F1: {:.4f}, Recon_loss: {:.4}, KLLoss: {:.4}, D_loss: {:.4}, G_loss: {:.4}, D_acu: {:.4}, D_lr: {:.4}'.format(
                 epoch,
                 iteration,
                 epoch_duration,
                 epoch_iou,
+                avg_val_iou,
                 epoch_precision,
                 epoch_recall,
                 epoch_f1,
@@ -578,6 +637,12 @@ def train_vae(args):
         if (epoch + 1) % args.pickle_step == 0:
             pickle_save_path = args.output_dir + args.pickle_dir + log_param
             save_new_pickle(pickle_save_path, epoch, G, G_solver, D, D_solver, E, E_solver)
+            
+            # Save validation metrics
+            with open(pickle_save_path + "/val_metrics.pkl", "wb") as f:
+                import pickle
+                pickle.dump(val_metrics, f)
+            print(f"Validation metrikleri kaydedildi: {pickle_save_path}/val_metrics.pkl")
 
         if args.lrsh and not args.wasserstein:  # WGAN için genellikle sabit lr kullanırız
             try:
