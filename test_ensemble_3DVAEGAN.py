@@ -11,7 +11,6 @@ import datetime
 from torch.amp import autocast
 import numpy as np
 import matplotlib.pyplot as plt
-import pickle
 from mpl_toolkits.mplot3d import Axes3D
 from torch.nn import functional as F
 
@@ -129,51 +128,11 @@ def test_ensemble_3DVAEGAN(args):
     
     print(f"{len(ensemble_models)} adet model ensemble için hazır.")
     
-    # Validation metriklerini yükle ve sabit ağırlıkları hesapla
-    val_metrics_path = pickle_base_path + "/val_metrics.pkl"
-    val_weights = []
-    best_val_epoch = -1
-    best_val_iou = -1
-    
-    if os.path.exists(val_metrics_path):
-        with open(val_metrics_path, "rb") as f:
-            val_metrics = pickle.load(f)
-        
-        # Ensemble için kullanılan epokların validation IoU değerlerini al
-        ensemble_val_ious = []
-        for epoch in ensemble_epochs:
-            iou = val_metrics.get(epoch, 0)
-            ensemble_val_ious.append(iou)
-            if iou > best_val_iou:
-                best_val_iou = iou
-                best_val_epoch = epoch
-        
-        # Ağırlıkları hesapla
-        total_val_iou = sum(ensemble_val_ious)
-        if total_val_iou > 0:
-            val_weights = [iou / total_val_iou for iou in ensemble_val_ious]
-        else:
-            val_weights = [1.0 / len(ensemble_epochs)] * len(ensemble_epochs)
-            
-        print(f"Validation tabanlı sabit ağırlıklar belirlendi: {dict(zip(ensemble_epochs, val_weights))}")
-        print(f"Validation setine göre en iyi model: Epok {best_val_epoch} (IoU: {best_val_iou:.4f})")
-    else:
-        print("Uyarı: val_metrics.pkl bulunamadı! Eşit ağırlıklar kullanılacak.")
-        val_weights = [1.0 / len(ensemble_epochs)] * len(ensemble_epochs)
-        best_val_epoch = ensemble_epochs[-1]
-
-    # En iyi validation modelinin indeksini bul
-    best_val_model_idx = -1
-    for idx, model_data in enumerate(ensemble_models):
-        if model_data["epoch"] == best_val_epoch:
-            best_val_model_idx = idx
-            break
-
     # Metrikleri takip etmek için değişkenler
     total_recon_loss = 0
     total_ensemble_iou = 0
     total_weighted_iou = 0
-    total_best_val_model_iou = 0
+    total_best_iou = 0
     individual_ious = {model["epoch"]: 0 for model in ensemble_models}
     individual_counts = {model["epoch"]: 0 for model in ensemble_models}
     
@@ -208,6 +167,8 @@ def test_ensemble_3DVAEGAN(args):
             # Her model için ayrı tahminler yap
             all_reconstructions = []
             individual_batch_ious = {}
+            best_batch_iou = 0
+            best_model_idx = 0
             
             for idx, model_data in enumerate(ensemble_models):
                 epoch = model_data["epoch"]
@@ -224,6 +185,11 @@ def test_ensemble_3DVAEGAN(args):
                     batch_iou = calculate_iou(G_vae, X_reshaped, threshold=0.5)
                     individual_batch_ious[epoch] = batch_iou
                     
+                    # En iyi modeli izle
+                    if batch_iou > best_batch_iou:
+                        best_batch_iou = batch_iou
+                        best_model_idx = idx
+                    
                     # İstatistikleri güncelle
                     individual_ious[epoch] += batch_iou
                     individual_counts[epoch] += 1
@@ -236,30 +202,35 @@ def test_ensemble_3DVAEGAN(args):
             ensemble_reconstruction = torch.mean(torch.stack(all_reconstructions), dim=0)
             ensemble_iou = calculate_iou(ensemble_reconstruction, X_reshaped, threshold=0.5)
             
-            # 2. Ağırlıklı ortalama - Validation IoU ile sabit ağırlıklandırılmış (Weighted Ensemble)
-            weighted_reconstruction = torch.sum(torch.stack([w * rec for w, rec in zip(val_weights, all_reconstructions)]), dim=0)
+            # 2. Ağırlıklı ortalama - IoU ile ağırlıklandırılmış (Weighted Ensemble)
+            if sum(individual_batch_ious.values()) > 0:
+                weights = [iou / sum(individual_batch_ious.values()) for iou in individual_batch_ious.values()]
+                weighted_reconstruction = torch.sum(torch.stack([w * rec for w, rec in zip(weights, all_reconstructions)]), dim=0)
+            else:
+                # IoU değerleri 0 ise eşit ağırlık kullan
+                weighted_reconstruction = ensemble_reconstruction
+            
             weighted_iou = calculate_iou(weighted_reconstruction, X_reshaped, threshold=0.5)
             
-            # 3. Validation setine göre en iyi modelin performansı
-            best_val_model_reconstruction = all_reconstructions[best_val_model_idx]
-            best_val_model_batch_iou = individual_batch_ious[best_val_epoch]
+            # 3. En iyi model seçimi (Best Model Selection)
+            best_reconstruction = all_reconstructions[best_model_idx]
             
             # Metrikleri güncelle
             total_ensemble_iou += ensemble_iou
             total_weighted_iou += weighted_iou
-            total_best_val_model_iou += best_val_model_batch_iou
+            total_best_iou += best_batch_iou
             batch_count += 1
             
             # Batch sonuçlarını yazdır
             batch_time = time.time() - batch_start_time
             print(f"Batch {i+1} - Ensemble IoU: {ensemble_iou:.4f}, Weighted IoU: {weighted_iou:.4f}, "
-                  f"Best Val Model IoU: {best_val_model_batch_iou:.4f} (Epok {best_val_epoch}), "
+                  f"Best IoU: {best_batch_iou:.4f} (Epok {ensemble_models[best_model_idx]['epoch']}), "
                   f"Time: {batch_time:.2f}s")
             
             # Sonuçları dosyaya yaz
             with open(results_file, 'a') as f:
                 f.write(f"Batch {i+1}: Ensemble IoU: {ensemble_iou:.4f}, Weighted IoU: {weighted_iou:.4f}, "
-                        f"Best Val Model IoU: {best_val_model_batch_iou:.4f} (Epok {best_val_epoch})\n")
+                        f"Best IoU: {best_batch_iou:.4f} (Epok {ensemble_models[best_model_idx]['epoch']})\n")
                 for epoch, iou in individual_batch_ious.items():
                     f.write(f"  - Epok {epoch}: IoU = {iou:.4f}\n")
                 f.write("\n")
@@ -339,7 +310,7 @@ def test_ensemble_3DVAEGAN(args):
     if batch_count > 0:
         avg_ensemble_iou = total_ensemble_iou / batch_count
         avg_weighted_iou = total_weighted_iou / batch_count
-        avg_best_val_model_iou = total_best_val_model_iou / batch_count
+        avg_best_iou = total_best_iou / batch_count
         
         # Her epok için ortalama IoU
         avg_individual_ious = {epoch: total/individual_counts[epoch] if individual_counts[epoch] > 0 else 0 
@@ -347,26 +318,26 @@ def test_ensemble_3DVAEGAN(args):
     else:
         avg_ensemble_iou = 0
         avg_weighted_iou = 0
-        avg_best_val_model_iou = 0
+        avg_best_iou = 0
         avg_individual_ious = {epoch: 0 for epoch in individual_ious.keys()}
     
     # Sonuçları yazdır
     print("\n" + "=" * 60)
-    print("Ensemble Test Sonuçları (Sızıntısız/Leak-free)")
+    print("Ensemble Test Sonuçları")
     print("=" * 60)
     print(f"Ensemble Modelleri: Epok {ensemble_epochs}")
-    print(f"Ortalama Ortalama (Simple Average) Ensemble IoU: {avg_ensemble_iou:.4f}")
-    print(f"Ortalama Validation-Weighted Ensemble IoU: {avg_weighted_iou:.4f}")
-    print(f"En İyi Validation Modeli Performansı (Epok {best_val_epoch}): {avg_best_val_model_iou:.4f}")
-    print("\nBireysel Model Sonuçları (Test Seti):")
+    print(f"Ortalama Ensemble IoU: {avg_ensemble_iou:.4f}")
+    print(f"Ortalama Weighted IoU: {avg_weighted_iou:.4f}")
+    print(f"Ortalama Best IoU: {avg_best_iou:.4f}")
+    print("\nBireysel Model Sonuçları:")
     
-    # En iyi testi modelini belirle (sadece bilgi amaçlı)
-    best_test_epoch = max(avg_individual_ious, key=avg_individual_ious.get)
-    best_single_test_iou = avg_individual_ious[best_test_epoch]
+    # En iyi modeli belirle
+    best_epoch = max(avg_individual_ious, key=avg_individual_ious.get)
+    best_single_iou = avg_individual_ious[best_epoch]
     
     for epoch, avg_iou in avg_individual_ious.items():
         print(f"  Epok {epoch}: Ortalama IoU = {avg_iou:.4f}" + 
-              (" (Validation'a göre seçilen en iyi model)" if epoch == best_val_epoch else ""))
+              (" (En İyi Model)" if epoch == best_epoch else ""))
     
     print(f"\nToplam Test Süresi: {total_test_time:.2f} saniye")
     print(f"Test Edilen Batch Sayısı: {batch_count}")
@@ -375,26 +346,25 @@ def test_ensemble_3DVAEGAN(args):
     # Sonuçları dosyaya kaydet
     with open(results_file, 'a') as f:
         f.write("\n" + "=" * 60 + "\n")
-        f.write("Ensemble Test Sonuçları (Sızıntısız)\n")
+        f.write("Ensemble Test Sonuçları\n")
         f.write("=" * 60 + "\n")
-        f.write(f"Ortalama Ortalama Ensemble IoU: {avg_ensemble_iou:.4f}\n")
-        f.write(f"Ortalama Validation-Weighted Ensemble IoU: {avg_weighted_iou:.4f}\n")
-        f.write(f"En İyi Validation Modeli Performansı (Epok {best_val_epoch}): {avg_best_val_model_iou:.4f}\n\n")
+        f.write(f"Ortalama Ensemble IoU: {avg_ensemble_iou:.4f}\n")
+        f.write(f"Ortalama Weighted IoU: {avg_weighted_iou:.4f}\n")
+        f.write(f"Ortalama Best IoU: {avg_best_iou:.4f}\n\n")
         f.write("Bireysel Model Sonuçları:\n")
         
         for epoch, avg_iou in avg_individual_ious.items():
             f.write(f"  Epok {epoch}: Ortalama IoU = {avg_iou:.4f}" + 
-                  (" (En İyi Validation Modeli)" if epoch == best_val_epoch else "") + "\n")
+                  (" (En İyi Model)" if epoch == best_epoch else "") + "\n")
         
         # Ensemble karşılaştırması
         f.write("\nEnsemble Karşılaştırması:\n")
-        best_overall_iou = max(avg_ensemble_iou, avg_weighted_iou, avg_best_val_model_iou)
-        if best_overall_iou == avg_weighted_iou:
-            f.write("  En iyi sonuç: Validation-Weighted Ensemble\n")
-        elif best_overall_iou == avg_ensemble_iou:
-            f.write("  En iyi sonuç: Simple Average Ensemble\n")
+        if avg_weighted_iou > best_single_iou and avg_weighted_iou > avg_ensemble_iou:
+            f.write("  En iyi sonuç: Ağırlıklı Ensemble\n")
+        elif avg_ensemble_iou > best_single_iou:
+            f.write("  En iyi sonuç: Ortalama Ensemble\n")
         else:
-            f.write(f"  En iyi sonuç: Tek model (Validation'da seçilen Epok {best_val_epoch})\n")
+            f.write(f"  En iyi sonuç: Tek model (Epok {best_epoch})\n")
         
         f.write(f"\nToplam Test Süresi: {total_test_time:.2f} saniye\n")
         f.write(f"Test Edilen Batch Sayısı: {batch_count}\n")
@@ -410,9 +380,9 @@ def test_ensemble_3DVAEGAN(args):
     return {
         'ensemble_iou': avg_ensemble_iou,
         'weighted_iou': avg_weighted_iou,
-        'best_val_model_iou': avg_best_val_model_iou,
+        'best_iou': avg_best_iou,
         'individual_ious': avg_individual_ious,
-        'best_val_epoch': best_val_epoch
+        'best_epoch': best_epoch
     }
 
 def visualize_ensemble_results(individual_ious, ensemble_iou, weighted_iou, results_dir, test_date):

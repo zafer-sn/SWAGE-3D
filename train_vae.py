@@ -2,12 +2,10 @@ import torch
 from torch import optim
 from torch import nn
 import torch.multiprocessing as mp
-from torch.utils.data import random_split
 from collections import OrderedDict
-import pickle
 from utils import make_hyparam_string, save_new_pickle, read_pickle, SavePloat_Voxels, generateZ, calculate_iou, calculate_metrics
 from utils import calculate_wasserstein_loss_d, calculate_wasserstein_loss_g, compute_gradient_penalty, calculate_accuracy_for_wasserstein
-from utils import get_mixup_params, apply_mixup_with_params
+from utils import apply_2d_mixup, apply_3d_mixup, apply_latent_mixup
 import utils
 import os
 import time
@@ -59,17 +57,12 @@ def train_vae(args):
 
     # Dataloader optimizasyonu
     dsets_path = args.input_dir + args.data_dir + "train/"
-    print(f"Veri seti yolu: {dsets_path}")
-    full_dsets = ShapeNetPlusImageDataset(dsets_path, args)
-    
-    # Veriyi %80 train, %20 validation olarak böl
-    train_size = int(0.8 * len(full_dsets))
-    val_size = len(full_dsets) - train_size
-    train_dsets, val_dsets = random_split(full_dsets, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+    print(dsets_path)
+    dsets = ShapeNetPlusImageDataset(dsets_path, args)
     
     # Optimize edilmiş dataloader ayarları
     dset_loaders = torch.utils.data.DataLoader(
-        train_dsets, 
+        dsets, 
         batch_size=args.batch_size, 
         shuffle=True, 
         num_workers=args.num_workers,
@@ -79,19 +72,8 @@ def train_vae(args):
         drop_last=True
     )
 
-    val_loader = torch.utils.data.DataLoader(
-        val_dsets,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
-        prefetch_factor=args.prefetch_factor,
-        persistent_workers=(args.num_workers > 0),
-        drop_last=False
-    )
-
     # Veri yükleyici uyarısı
-    print(f"Dataloader: {args.num_workers} işçi ile optimize edilmiş veri yükleme aktif (Train: {len(train_dsets)}, Val: {len(val_dsets)})")
+    print(f"Dataloader: {args.num_workers} işçi ile optimize edilmiş veri yükleme aktif")
 
     # model define
     D = _D(args)
@@ -182,9 +164,6 @@ def train_vae(args):
         best_g_loss = float('inf')
         best_recon_loss = float('inf')
 
-    # Validation metriklerini takip etmek için
-    val_metrics = {}
-
     for epoch in range(args.n_epochs):
         # GPU belleğini optimize et
         if args.optimize_memory and torch.cuda.is_available():
@@ -233,35 +212,25 @@ def train_vae(args):
                     with autocast(device_type='cuda', enabled=args.use_amp):
                         Z = generateZ(args)
                         
-                        # 3D modelin görünümünü ayarla
-                        model_3d_view = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+                        # MixUp uygulamaları (aktif ise)
+                        if args.use_2d_mixup and np.random.random() < args.mixup_prob:
+                            image_mixed = apply_2d_mixup(image, args.mixup_alpha)
+                        else:
+                            image_mixed = image
                         
-                        # Varsayılan değerler
-                        image_mixed = image
-                        model_3d_mixed = model_3d_view
-                        model_3d_target = model_3d_view # Reconstruction hedefi
-                        
-                        # Giriş ve Veri MixUp (aktif ise)
-                        if (args.use_2d_mixup or args.use_3d_mixup) and np.random.random() < args.mixup_prob:
-                            lam, indices = get_mixup_params(image.size(0), args.mixup_alpha, image.device)
-                            if args.use_2d_mixup:
-                                image_mixed = apply_mixup_with_params(image, lam, indices)
-                                # Görüntü karıştıysa hedef de karışmalı
-                                model_3d_target = apply_mixup_with_params(model_3d_view, lam, indices)
-                            
-                            if args.use_3d_mixup:
-                                model_3d_mixed = apply_mixup_with_params(model_3d_view, lam, indices)
+                        if args.use_3d_mixup and np.random.random() < args.mixup_prob:
+                            model_3d_view = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+                            model_3d_mixed = apply_3d_mixup(model_3d_view, args.mixup_alpha)
+                        else:
+                            model_3d_view = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+                            model_3d_mixed = model_3d_view
                         
                         # Encoder çıktıları
                         z_mu, z_var = E(image_mixed)
                         
                         # Latent MixUp (aktif ise)
                         if args.use_latent_mixup and np.random.random() < args.mixup_prob:
-                            lam_z, indices_z = get_mixup_params(z_mu.size(0), args.mixup_alpha, z_mu.device)
-                            z_mu_mixed = apply_mixup_with_params(z_mu, lam_z, indices_z)
-                            z_var_mixed = apply_mixup_with_params(z_var, lam_z, indices_z)
-                            # Latent karışınca hedef de aynı oranda karışmalı
-                            model_3d_target = apply_mixup_with_params(model_3d_target, lam_z, indices_z)
+                            z_mu_mixed, z_var_mixed = apply_latent_mixup(z_mu, z_var, args.mixup_alpha)
                         else:
                             z_mu_mixed, z_var_mixed = z_mu, z_var
                         
@@ -271,7 +240,7 @@ def train_vae(args):
                         # Discriminator çıktıları
                         d_real = D(model_3d_mixed)
                         fake = G(Z)
-                        d_fake = D(fake.detach())
+                        d_fake = D(fake.detach())  # Generator'ın gradyandan etkilenmemesi için detach
                         
                         # Wasserstein loss hesaplama
                         d_loss = calculate_wasserstein_loss_d(d_real, d_fake)
@@ -309,35 +278,21 @@ def train_vae(args):
                 with autocast(device_type='cuda', enabled=args.use_amp):
                     Z = generateZ(args)
                     
-                    # 3D modelin görünümünü ayarla
-                    model_3d_view = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+                    # MixUp uygulamaları (aktif ise)
+                    if args.use_2d_mixup and np.random.random() < args.mixup_prob:
+                        image = apply_2d_mixup(image, args.mixup_alpha)
                     
-                    # Varsayılan değerler
-                    image_mixed = image
-                    model_3d_mixed = model_3d_view
-                    model_3d_target = model_3d_view
+                    if args.use_3d_mixup and np.random.random() < args.mixup_prob:
+                        model_3d = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+                        model_3d = apply_3d_mixup(model_3d, args.mixup_alpha)
                     
-                    # Giriş ve Veri MixUp (aktif ise)
-                    if (args.use_2d_mixup or args.use_3d_mixup) and np.random.random() < args.mixup_prob:
-                        lam, indices = get_mixup_params(image.size(0), args.mixup_alpha, image.device)
-                        if args.use_2d_mixup:
-                            image_mixed = apply_mixup_with_params(image, lam, indices)
-                            model_3d_target = apply_mixup_with_params(model_3d_view, lam, indices)
-                        if args.use_3d_mixup:
-                            model_3d_mixed = apply_mixup_with_params(model_3d_view, lam, indices)
-                    
-                    z_mu, z_var = E(image_mixed)
+                    z_mu, z_var = E(image)
                     
                     # Latent MixUp (aktif ise)
                     if args.use_latent_mixup and np.random.random() < args.mixup_prob:
-                        lam_z, indices_z = get_mixup_params(z_mu.size(0), args.mixup_alpha, z_mu.device)
-                        z_mu_mixed = apply_mixup_with_params(z_mu, lam_z, indices_z)
-                        z_var_mixed = apply_mixup_with_params(z_var, lam_z, indices_z)
-                        model_3d_target = apply_mixup_with_params(model_3d_target, lam_z, indices_z)
-                    else:
-                        z_mu_mixed, z_var_mixed = z_mu, z_var
+                        z_mu, z_var = apply_latent_mixup(z_mu, z_var, args.mixup_alpha)
                     
-                    Z_vae = E.reparameterize(z_mu_mixed, z_var_mixed)
+                    Z_vae = E.reparameterize(z_mu, z_var)
                     G_vae = G(Z_vae)
 
                     # Geleneksel GAN loss hesaplama
@@ -348,7 +303,7 @@ def train_vae(args):
                         real_labels = var_or_cuda(torch.Tensor(args.batch_size).uniform_(0.7, 1.0))
                         fake_labels = var_or_cuda(torch.Tensor(args.batch_size).uniform_(0, 0.3))
 
-                    d_real = D(model_3d_mixed)
+                    d_real = D(model_3d)
                     d_real_loss = criterion(d_real.squeeze(), real_labels)
 
                     fake = G(Z)
@@ -375,18 +330,22 @@ def train_vae(args):
 
             # ============= Train the Encoder =============#
             with autocast(device_type='cuda', enabled=args.use_amp):
-                # Recon loss: Batch başına ortalama MSE - Hedef olarak karıştırılmış modeli kullan
-                recon_loss = torch.mean(torch.sum(torch.pow((G_vae - model_3d_target), 2), dim=(1, 2, 3, 4)))
+                # Burada model_3d'yi WGAN için tekrar düzgün formata getirmeliyiz
+                if not args.wasserstein or model_3d.dim() != 5:
+                    model_3d = model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
+                
+                # Recon loss: Batch başına ortalama MSE
+                recon_loss = torch.mean(torch.sum(torch.pow((G_vae - model_3d), 2), dim=(1, 2, 3, 4)))
                 
                 # KL kaybını batch ortalaması alınarak hesaplama
-                KLLoss = -0.5 * torch.mean(torch.sum(1 + z_var_mixed - torch.pow(z_mu_mixed, 2) - torch.exp(z_var_mixed), dim=1))
+                KLLoss = -0.5 * torch.mean(torch.sum(1 + z_var - torch.pow(z_mu, 2) - torch.exp(z_var), dim=1))
                 
                 # VAE β-parametresi ile iki kaybı dengeleme
                 beta = 1.0  # Varsayılan beta değeri
                 E_loss = recon_loss + beta * KLLoss
 
             # IoU değerini batch için hesaplama
-            batch_iou = calculate_iou(G_vae, model_3d_target)
+            batch_iou = calculate_iou(G_vae, model_3d)
             
             E.zero_grad()
             # AMP ile gradient hesaplama ve optimizasyon
@@ -412,7 +371,7 @@ def train_vae(args):
                 # VAE branch'ı ile yeniden oluşturma hatasını hesaplama
                 Z_vae_detached = Z_vae.detach()
                 G_vae_new = G(Z_vae_detached)
-                recon_loss_new = torch.mean(torch.sum(torch.pow((G_vae_new - model_3d_target), 2), dim=(1, 2, 3, 4)))
+                recon_loss_new = torch.mean(torch.sum(torch.pow((G_vae_new - model_3d), 2), dim=(1, 2, 3, 4)))
                 
                 lambda_recon = 1.0  # İhtiyaca göre ayarlanabilir
                 g_loss = gan_loss + lambda_recon * recon_loss_new
@@ -450,42 +409,6 @@ def train_vae(args):
             # Her 10 yinelemede bir bellek kullanımını raporla
             if args.optimize_memory and i % 10 == 0 and torch.cuda.is_available():
                 print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
-
-        # =============== Validation Phase ===============#
-        D.eval()
-        G.eval()
-        E.eval()
-        val_epoch_iou = 0
-        val_batch_count = 0
-        
-        with torch.no_grad():
-            for i, (val_image, val_model_3d) in enumerate(val_loader):
-                if args.use_amp:
-                    val_model_3d = val_model_3d.to(device='cuda', non_blocking=True)
-                    val_image = val_image.to(device='cuda', non_blocking=True)
-                else:
-                    val_model_3d = var_or_cuda(val_model_3d)
-                    val_image = var_or_cuda(val_image)
-                
-                val_model_3d_view = val_model_3d.view(-1, 1, args.cube_len, args.cube_len, args.cube_len)
-                
-                with autocast(device_type='cuda', enabled=args.use_amp):
-                    z_mu, z_var = E(val_image)
-                    Z_vae = E.reparameterize(z_mu, z_var)
-                    G_vae = G(Z_vae)
-                    
-                    val_iou = calculate_iou(G_vae, val_model_3d_view)
-                    val_epoch_iou += val_iou
-                    val_batch_count += 1
-        
-        avg_val_iou = val_epoch_iou / val_batch_count if val_batch_count > 0 else 0
-        val_metrics[epoch] = avg_val_iou
-        
-        # Modelleri tekrar eğitim moduna al
-        D.train()
-        G.train()
-        E.train()
-        # ================================================#
 
         # Epoch ortalaması hesaplama
         if batch_count > 0:
@@ -592,12 +515,11 @@ def train_vae(args):
 
         # =============== each epoch save model or save image ===============#
         if args.wasserstein:
-            print('Epoch-{}, Iter-{}; Duration: {:.2f}s, IoU: {:.4f}, Val_IoU: {:.4f}, Recon_loss: {:.4f}, KLLoss: {:.4f}, D_loss: {:.4f}, G_loss: {:.4f}, D_acu: {:.4f}'.format(
+            print('Epoch-{}, Iter-{}; Duration: {:.2f}s, IoU: {:.4f}, Recon_loss: {:.4f}, KLLoss: {:.4f}, D_loss: {:.4f}, G_loss: {:.4f}, D_acu: {:.4f}'.format(
                 epoch,
                 iteration,
                 epoch_duration,
                 epoch_iou,
-                avg_val_iou,
                 epoch_recon_loss,
                 epoch_kl_loss,
                 epoch_d_loss, 
@@ -608,12 +530,11 @@ def train_vae(args):
             if args.gradient_penalty:
                 print('Gradient Penalty: {:.4f}'.format(epoch_gp))
         else:
-            print('Epoch-{}, Iter-{}; Duration: {:.2f}s, IoU: {:.4f}, Val_IoU: {:.4f}, Precision: {:.4f}, Recall: {:.4f}, F1: {:.4f}, Recon_loss: {:.4}, KLLoss: {:.4}, D_loss: {:.4}, G_loss: {:.4}, D_acu: {:.4}, D_lr: {:.4}'.format(
+            print('Epoch-{}, Iter-{}; Duration: {:.2f}s, IoU: {:.4f}, Precision: {:.4f}, Recall: {:.4f}, F1: {:.4f}, Recon_loss: {:.4}, KLLoss: {:.4}, D_loss: {:.4}, G_loss: {:.4}, D_acu: {:.4}, D_lr: {:.4}'.format(
                 epoch,
                 iteration,
                 epoch_duration,
                 epoch_iou,
-                avg_val_iou,
                 epoch_precision,
                 epoch_recall,
                 epoch_f1,
@@ -637,12 +558,6 @@ def train_vae(args):
         if (epoch + 1) % args.pickle_step == 0:
             pickle_save_path = args.output_dir + args.pickle_dir + log_param
             save_new_pickle(pickle_save_path, epoch, G, G_solver, D, D_solver, E, E_solver)
-            
-            # Save validation metrics
-            with open(pickle_save_path + "/val_metrics.pkl", "wb") as f:
-                import pickle
-                pickle.dump(val_metrics, f)
-            print(f"Validation metrikleri kaydedildi: {pickle_save_path}/val_metrics.pkl")
 
         if args.lrsh and not args.wasserstein:  # WGAN için genellikle sabit lr kullanırız
             try:
